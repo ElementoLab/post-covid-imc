@@ -1,0 +1,19 @@
+sample_name,internal_code,age,gender,organism,organ,disease,observations
+A18_19_A19,,71,M,Human,Lung,Normal,
+A19_15_A24,,66,M,Human,Lung,Normal,
+S19_6699_B9,nl1966699,75,M,Human,Lung,Normal,
+A21_48_A21,WCMC64,,,Human,Lung,Mixed,Acute and (ineligible)
+S15_38419_B1,,73,F,Human,Lung,UIP/IPF,
+S17_22391_A4,,70,M,Human,Lung,UIP/IPF,
+S20_1842_A7,,64,M,Human,Lung,UIP/IPF,
+A20_55_A24,WCMC10,56,F,Human,Lung,COVID-19,Set1
+A20_79_A23,WCMC30,52,M,Human,Lung,COVID-19,Set1
+A20_100_A28,WCMC38,52,M,Human,Lung,Convalescent,
+A20_102_A34,WCMC39,61,M,Human,Lung,Convalescent,
+A20_105_A25,WCMC40,71,F,Human,Lung,Convalescent,
+A20_137_A26,WCMC5,95,F,Human,Lung,Convalescent,
+A20_185_A33_v1,WCMC55,,,Human,Lung,Convalescent,
+A21_36_A18,WCMC68,,,Human,Lung,Convalescent,
+A21_67_A30,WCMC64,,,Human,Lung,Convalescent,
+A21_70_A37,WCMC70,,,Human,Lung,Convalescent,Convalescent and (ineligible)
+A21_76_A16,WCMC71,,,Human,Lung,Convalescent,

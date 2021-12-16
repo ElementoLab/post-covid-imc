@@ -1,0 +1,10 @@
+parmap
+tqdm
+pandas
+numpy
+matplotlib
+seaborn
+scanpy
+seaborn_extensions
+
+git+ssh://git@github.com/ElementoLab/imc.git
