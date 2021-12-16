@@ -155,69 +155,80 @@ def abundance_comparison(a: AnnData):
 
 
 def add_microanatomy_context(a: AnnData):
-    from gatdu.segmentation import segment_slide
+    from gatdu.segmentation import segment_slide as utag
 
+    output_dir = (config.results_dir / "domains").mkdir()
+
+    # Run domain discovery
     b = a[:, ~a.var.index.isin(config.channels_exclude)]
     b = b.raw.to_adata()[:, b.var.index]
     b = b[:, b.var.index != "Ki67(Er168)"]
-    b.raw = b
-    sc.pp.log1p(b)
-    sc.pp.scale(b)
-    sc.pp.combat(b, "sample")
-    sc.pp.scale(b)
 
-    s = segment_slide(b, save_key="gatdu_cluster", slide_key="roi", max_dist=20)
-    s.write(config.results_dir / "utag.reprocessed_combat.h5ad")
-    s = sc.read(config.results_dir / "utag.reprocessed_combat.h5ad")
-
-    clusts = s.obs.columns[s.obs.columns.str.contains("gatdu_cluster")].tolist()
-    sc.pl.pca(s, color=["sample"] + clusts)
-    sc.pl.umap(s, color=["sample"] + clusts)
+    s = utag(
+        b,
+        save_key="utag_cluster",
+        slide_key="roi",
+        max_dist=20,
+        clustering_method=["leiden"],
+        resolutions=[0.3],
+    )
+    # clusts = s.obs.columns[s.obs.columns.str.contains("utag_cluster")].tolist()
+    # sc.pl.pca(s, color=["sample"] + clusts)
+    # sc.pl.umap(s, color=["sample"] + clusts)
     # sc.pl.spatial(s, spot_size=20, color=s.var.index.tolist() + clusts)
 
-    clust = "gatdu_cluster_parc_0.3"
+    # Observe the cell type composition of domains
+    clust = "gatdu_cluster_leiden_0.3"
     c = s.obs.groupby(clust)["cell_type_label"].value_counts()
     cf = c / c.groupby(level=0).sum()
-
     cfp = cf.reset_index().pivot_table(
-        index="gatdu_cluster_parc_0.3", columns="level_1", values="cell_type_label"
+        index=clust, columns="level_1", values="cell_type_label"
     )
     grid = clustermap(cfp, config="abs")
-    grid = clustermap(cfp, config="z")
+    grid.fig.savefig(output_dir / "domain_composition.clustermap.svg")
 
     domain_assignments = {
-        12: "Glands",
-        14: "Immune",
-        0: "Alveolar",
-        13: "Alveolar",
-        9: "Alveolar",
-        11: "Alveolar",
-        5: "Immune",
-        2: "Immune",
-        4: "Immune",
-        7: "Vessel",
-        3: "Alveolar",
         8: "Airway",
-        1: "Connective",
-        6: "Connective",
-        10: "Connective",
+        13: "Airway",
+        3: "Alveolar",
+        9: "Alveolar",
+        4: "Alveolar",
+        12: "Alveolar",
+        0: "Alveolar",
+        1: "Vessel",
+        11: "Vessel",
+        2: "Connective",
+        7: "Immune",
+        10: "Immune",
+        5: "Immune",
+        6: "Immune",
     }
-    s.obs["domain"] = pd.Categorical(
-        s.obs["gatdu_cluster_parc_0.3"].astype(int).replace(domain_assignments)
-    )
+    s.obs["domain"] = pd.Categorical(s.obs[clust].astype(int).replace(domain_assignments))
+    s.write(output_dir / "utag.h5ad")
 
-    a
+    # this is just to have consistent colors across ROIs for 'domain'
+    _ = sc.pl.umap(s, color="domain", show=False)
+    plt.close("all")
 
-    roi_name = "S19_6699_B9-01"
-    s1 = s[s.obs["roi"] == roi_name, :]
-    sc.pl.spatial(s1, spot_size=20, color=[clust, "cell_type_label", "domain"])
+    # Illustrate domains for each ROI
+    for sample in tqdm(prj.samples):
+        n = len(sample.rois)
+        fig, axes = plt.subplots(n, 3, figsize=(3 * 4, n * 4))
+        for axs, roi_name in zip(axes, [r.name for r in sample.rois]):
+            s1 = s[s.obs["roi"] == roi_name, :].copy()
+            for ax, c in zip(axs, [clust, "cell_type_label", "domain"]):
+                sc.pl.spatial(s1, spot_size=20, color=c, show=False, ax=ax)
+        rasterize_scanpy(fig)
+        fig.savefig(output_dir / f"domain_composition.illustration.{sample.name}.svg")
+        plt.close(fig)
 
 
-# GATDU improvements:
-# - Default max_dist
+# UTAG improvements:
+# - Default max_dist == 20
 # - Warn when std nor present in .var or calculate it
 # - Keep .var from original object
 # - Cluster PARC vs Leiden: homogenize int vs str
+# - PARC clustering, reuse neighbor graph
 
 
 if __name__ == "__main__" and "get_ipython" not in locals():
