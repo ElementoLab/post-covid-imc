@@ -154,6 +154,72 @@ def abundance_comparison(a: AnnData):
     )
 
 
+def add_microanatomy_context(a: AnnData):
+    from gatdu.segmentation import segment_slide
+
+    b = a[:, ~a.var.index.isin(config.channels_exclude)]
+    b = b.raw.to_adata()[:, b.var.index]
+    b = b[:, b.var.index != "Ki67(Er168)"]
+    b.raw = b
+    sc.pp.log1p(b)
+    sc.pp.scale(b)
+    sc.pp.combat(b, "sample")
+    sc.pp.scale(b)
+
+    s = segment_slide(b, save_key="gatdu_cluster", slide_key="roi", max_dist=20)
+    s.write(config.results_dir / "utag.reprocessed_combat.h5ad")
+    s = sc.read(config.results_dir / "utag.reprocessed_combat.h5ad")
+
+    clusts = s.obs.columns[s.obs.columns.str.contains("gatdu_cluster")].tolist()
+    sc.pl.pca(s, color=["sample"] + clusts)
+    sc.pl.umap(s, color=["sample"] + clusts)
+    # sc.pl.spatial(s, spot_size=20, color=s.var.index.tolist() + clusts)
+
+    clust = "gatdu_cluster_parc_0.3"
+    c = s.obs.groupby(clust)["cell_type_label"].value_counts()
+    cf = c / c.groupby(level=0).sum()
+
+    cfp = cf.reset_index().pivot_table(
+        index="gatdu_cluster_parc_0.3", columns="level_1", values="cell_type_label"
+    )
+    grid = clustermap(cfp, config="abs")
+    grid = clustermap(cfp, config="z")
+
+    domain_assignments = {
+        12: "Glands",
+        14: "Immune",
+        0: "Alveolar",
+        13: "Alveolar",
+        9: "Alveolar",
+        11: "Alveolar",
+        5: "Immune",
+        2: "Immune",
+        4: "Immune",
+        7: "Vessel",
+        3: "Alveolar",
+        8: "Airway",
+        1: "Connective",
+        6: "Connective",
+        10: "Connective",
+    }
+    s.obs["domain"] = pd.Categorical(
+        s.obs["gatdu_cluster_parc_0.3"].astype(int).replace(domain_assignments)
+    )
+
+    a
+
+    roi_name = "S19_6699_B9-01"
+    s1 = s[s.obs["roi"] == roi_name, :]
+    sc.pl.spatial(s1, spot_size=20, color=[clust, "cell_type_label", "domain"])
+
+
+# GATDU improvements:
+# - Default max_dist
+# - Warn when std nor present in .var or calculate it
+# - Keep .var from original object
+# - Cluster PARC vs Leiden: homogenize int vs str
+
+
 if __name__ == "__main__" and "get_ipython" not in locals():
     import sys
 
