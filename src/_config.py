@@ -26,11 +26,15 @@ class config:
         "129Xe",
     ]
     roi_exclude_strings: tp.Final[tp.List[str]] = [
-        "A20_105_A25-06",
         "A19_15_A24-01",
+        "A19_15_A24-02",
         "A19_15_A24-03",
         "A19_15_A24-04",
         "A19_15_A24-05",
+        "A19_33_A26-01",
+        "A20_105_A25-06",
+        "A21_22_A38-03",
+        "A21_22_A38-06",
     ]
 
     channels_exclude: tp.List[str]

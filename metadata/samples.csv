@@ -1,4 +1,4 @@
-sample_name,internal_code,age,gender,organism,organ,disease,observations
+sample_name,alternative_id,age,gender,organism,organ,disease,observations
 A18_19_A19,,71,M,Human,Lung,Normal,
 A19_15_A24,,66,M,Human,Lung,Normal,
 A19_33_A26,,74,F,Human,Lung,Normal,
@@ -16,7 +16,9 @@ A20_102_A34,WCMC39,61,M,Human,Lung,Convalescent,
 A20_105_A25,WCMC40,71,F,Human,Lung,Convalescent,
 A20_137_A26,WCMC5,95,F,Human,Lung,Convalescent,
 A20_185_A33_v1,WCMC55,,,Human,Lung,Convalescent,
+A21_22_A38,WCMC51,,,Human,Lung,Convalescent,
 A21_36_A18,WCMC68,,,Human,Lung,Convalescent,
+A21_63_A14,WCMC61,,,Human,Lung,Convalescent,
 A21_67_A30,WCMC64,,,Human,Lung,Convalescent,
 A21_70_A37,WCMC70,,,Human,Lung,Convalescent,Convalescent and (ineligible)
 A21_76_A16,WCMC71,,,Human,Lung,Convalescent,
