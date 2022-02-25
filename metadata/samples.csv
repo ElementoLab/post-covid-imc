@@ -1,24 +1,24 @@
-sample_name,alternative_id,age,gender,organism,organ,disease,observations
-A18_19_A19,,71,M,Human,Lung,Normal,
-A19_15_A24,,66,M,Human,Lung,Normal,
-A19_33_A26,,74,F,Human,Lung,Normal,
-S19_6699_B9,nl1966699,75,M,Human,Lung,Normal,
-A21_48_A21,WCMC64,,,Human,Lung,Mixed,Acute and (ineligible)
-S15_38419_B1,,73,F,Human,Lung,UIP/IPF,
-S17_22391_A4,,70,M,Human,Lung,UIP/IPF,
-S20_1842_A7,,64,M,Human,Lung,UIP/IPF,
-A20_47_A37,WCMC3,71,M,Human,Lung,COVID-19,Set1
-A20_55_A24,WCMC10,56,F,Human,Lung,COVID-19,Set1
-A20_77_A27,WCMC28,61,M,Human,Lung,COVID-19,Set1
-A20_79_A23,WCMC30,52,M,Human,Lung,COVID-19,Set1
-A20_100_A28,WCMC38,52,M,Human,Lung,Convalescent,
-A20_102_A34,WCMC39,61,M,Human,Lung,Convalescent,
-A20_105_A25,WCMC40,71,F,Human,Lung,Convalescent,
-A20_137_A26,WCMC5,95,F,Human,Lung,Convalescent,
-A20_185_A33_v1,WCMC55,,,Human,Lung,Convalescent,
-A21_22_A38,WCMC51,,,Human,Lung,Convalescent,
-A21_36_A18,WCMC68,,,Human,Lung,Convalescent,
-A21_63_A14,WCMC61,,,Human,Lung,Convalescent,
-A21_67_A30,WCMC64,,,Human,Lung,Convalescent,
-A21_70_A37,WCMC70,,,Human,Lung,Convalescent,Convalescent and (ineligible)
-A21_76_A16,WCMC71,,,Human,Lung,Convalescent,
+sample_name,alternative_id,age,gender,organism,organ,disease,disease_subgroup,observations,fever,cough,shortness_of_breath,days_intubated,days_of_disease,days_in_hospital,PLT/mL,D-dimer (mg/L),WBC,LY%,PMN %,CRP mg/L,ESR mm/h,IL-6 ng/L,days_since_positive,days_negative_before_death,SARS PCR test/Cause of Death
+A18_19_A19,,71,M,Human,Lung,Normal,Normal,,,,,,,,,,,,,,,,,,MI
+A19_15_A24,,66,M,Human,Lung,Normal,Normal,,,,,,,,,,,,,,,,,,Intraabdominal bleed
+A19_33_A26,,74,F,Human,Lung,Normal,Normal,,,,,,,,,,,,,,,,,,
+S19_6699_B9,nl1966699,75,M,Human,Lung,Normal,Normal,,,,,,,,,,,,,,,,,,
+S15_38419_B1,,73,F,Human,Lung,UIP/IPF,UIP/IPF,,,,,,,,,,,,,,,,,,
+S17_22391_A4,,70,M,Human,Lung,UIP/IPF,UIP/IPF,,,,,,,,,,,,,,,,,,
+S20_1842_A7,,64,M,Human,Lung,UIP/IPF,UIP/IPF,,,,,,,,,,,,,,,,,,
+A20_47_A37,WCMC3,71,M,Human,Lung,COVID-19,COVID-19-early,Set1,Reported,Y,Y,0,5,0,na,na,na,na,na,NA,NA,NA,1,0,POS 3/29 DIES 3/29
+A20_55_A24,WCMC10,56,F,Human,Lung,COVID-19,COVID-19-early,Set1,Reported,Y,Y,0,11,5,400,33122,9.5,23,68,24.6,NA,NA,5,0,POS 4/4 DIES 4/9/20 SICK FROM 3/29
+A20_77_A27,WCMC28,61,M,Human,Lung,COVID-19,COVID-19-late,Set1,reported,N,Y,32,36,36,348,4848,15.8,0.9,97.1,,,,36,0,POS 3/30 DIES 5/5
+A20_79_A23,WCMC30,52,M,Human,Lung,COVID-19,COVID-19-late,Set1,39,Y,Y,29,35,35,126,5128,11.5,0.5,91.7,,,,36,0,POS 4/2/20  DIES 5/7/2020
+A21_48_A21,WCMC64,70,M,Human,Lung,Mixed,Mixed,Acute and (ineligible),,,,30,30,30,213,270,5.66,16,78.5,16.07,71,,1,0,covid pos 2 23 neg 3 19 pos 3/22 dies 3/22 
+A20_100_A28,WCMC38,52,M,Human,Lung,Convalescent,Convalescent,,38.2,N,Y,unk,44,unk,212,754,8.3,17,74.3,1.3,na,na,8,6,Sick 4/23 pos 4/28 - 5/29 then neg 6/1 6/2 6/4 died 6/6 
+A20_102_A34,WCMC39,61,M,Human,Lung,Convalescent,Convalescent,,,Y,Y,post covid,post covid,post covid,271,3996,9.3,3.9,86.5,4.1,,,27,21,"positive 3/27, 3/29ards  then pos 5/19 then negative  5/25, 26 6/8, 6/11 dies 6/15"
+A20_105_A25,WCMC40,71,F,Human,Lung,Convalescent,Convalescent,,N,N,N,post covid,post covid,post covid,,,,,,,,,29,14,"pos 5/19 neg 6/3, 6/8 6/16 6/17 died"
+A20_137_A26,WCMC5,95,F,Human,Lung,Convalescent,Convalescent,,36,N,N,28,post covid,28,304,1860,35.7,43,42,na,na,na,120,16,sars pos april; 7/14/20 indeterminate then negative x8 died 8/8/2020
+A20_185_A33_v1,WCMC55,43,F,Human,Lung,Convalescent,Convalescent,,,,,na,na,na,na,na,na,na,na,na,na,na,,18,"pos 3/18, negative 7/15 and 11/9; covid pneumonia 3/19 dies11/27"
+A21_22_A38,WCMC51,40,M,Human,Lung,Convalescent,Convalescent,,Y,Y,Y,30,50,43,300,3816,16.3,5.5,90.1,15.6,na,na,,10,"covid positive1/4  1/11, 1/19 then negative 2/3 2/5 expired 2/15"
+A21_36_A18,WCMC68,63,M,Human,Lung,Convalescent,COVID-19-long-pos,,Y,Y,N,0,unk,0,361,1067,3.8,12,74.6,15,121,,,0,covid april 2020 dies 2/25/2021 ruptured iliac aneurysm
+A21_63_A14,WCMC61,70,M,Human,Lung,Convalescent,COVID-19-long-pos,,Y,Y,Y,UNK,UNK,UNK,,,,,,,,,,0,coVID POS 5 /2020 - PROLONGED OXYGEN REQUIREMENT POST covid
+A21_67_A30,WCMC64,64,F,Human,Lung,Convalescent,Convalescent,,Y,N,N,0,5,22,269,2307,9.8,6.7,83,,66,,,18,covid pos 4/8/2021 neg 4 12 4 14 4 21 4 27 4 30 dies 4/30
+A21_70_A37,WCMC70,55,M,Human,Lung,Convalescent,COVID-19-long-pos,Convalescent and (ineligible),N,Y,Y,22,40,30,150,18538,6.4,12,82,5.27,72,,,0,covid pos 11/2020 covid pos 4/4 pos 5/3 dies 5/3
+A21_76_A16,WCMC71,63,M,Human,Lung,Convalescent,COVID-19-long-pos,,N,N,Y,0,18,18,165,5460,8.28,28,58,7,100,,,0,covid march 26 2020 died 5/14/2021
