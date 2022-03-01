@@ -55,11 +55,17 @@ class config:
         "gender",
     ]
     numeric_attributes = ["age"]
-    categorical_attributes = [
-        a for a in attributes if a not in config.numeric_attributes
-    ]
+    # categorical_attributes = [
+    #     a for a in attributes if a not in config.numeric_attributes
+    # ]
     attribute_order: tp.Dict[str, tp.List[str]] = dict(
-        disease=["Normal", "UIP/IPF", "COVID-19", "Mixed", "Convalescent"],
+        disease=[
+            "Normal",
+            "UIP/IPF",
+            "COVID-19",
+            "Mixed",
+            "Convalescent",
+        ],
         disease_subgroup=[
             "Normal",
             "UIP/IPF",
@@ -67,9 +73,12 @@ class config:
             "COVID-19-late",
             "Mixed",
             "COVID-19-long-pos",
-            "Convalescent",
+            "COVID-19-long-neg",
         ],
-        gender=["F", "M"],
+        gender=[
+            "F",
+            "M",
+        ],
     )
     roi_attributes: DataFrame
     sample_attributes: DataFrame
@@ -119,6 +128,7 @@ class config:
         "CD31(Eu151)",
         "CD45(Sm152)",
         "CD4(Gd156)",
+        "Periostin(Dy161)",
         "CD8a(Dy162)",
         "CC16(Dy163)",
         "AQ1(Dy164)",
@@ -144,7 +154,6 @@ class config:
         "pSTAT3Tyr705(Gd158)",
         "IRF2BP2(Tb159)",
         "IL6(Gd160)",
-        "Periostin(Dy161)",
         "pNFkbp65(Ho165)",
         "IL1beta(Er166)",
         # "Ki67(Er168)",
@@ -193,6 +202,8 @@ config.roi_attributes["sample"] = config.roi_attributes.index.str.split("-").map
 )
 for attr in config.numeric_attributes:
     config.roi_attributes[attr] = config.roi_attributes[attr].astype(float)
+for roi in prj.rois:
+    roi.attributes = config.attributes
 
 # # Samples
 sample_names = [x.name for x in prj.samples]
@@ -209,6 +220,8 @@ for attr in config.numeric_attributes:
 for df in [config.roi_attributes, config.sample_attributes]:
     for cat, order in config.attribute_order.items():
         df[cat] = pd.Categorical(df[cat], categories=order, ordered=True)
+for sample in prj:
+    sample.attributes = config.attributes
 
 
 # Calculate area space
