@@ -110,8 +110,8 @@ class config:
     counts_file: tp.Final[Path] = results_dir / "cell_type" / "cell_type_counts.pq"
 
     # Areas of images/samples
-    roi_areas_file: tp.Final[Path] = results_dir / "roi_areas.csv"
-    sample_areas_file: tp.Final[Path] = results_dir / "sample_areas.csv"
+    roi_areas_file: tp.Final[Path] = metadata_dir / "roi_areas.csv"
+    sample_areas_file: tp.Final[Path] = metadata_dir / "sample_areas.csv"
     roi_areas: tp.Final[DataFrame]
     sample_areas: tp.Final[DataFrame]
 
