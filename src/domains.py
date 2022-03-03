@@ -32,7 +32,6 @@ def main() -> int:
 
     # Get domains
     topo_annots, topo_sc = get_topological_domain_annotation()
-    json.dump(topo_annots, (config.metadata_dir / "topological_domains.json").open("w"))
 
     # Illustrate
     # # simplify vessels
@@ -127,11 +126,11 @@ def main() -> int:
 
 
 def get_topological_domain_annotation():
-
-    domain_f = config.metadata_dir / "topological_domain_assignment.csv"
     labeling_dir = output_dir / "manual"
 
-    topo_annots = collect_domains(labeling_dir)
+    polygon_f = config.metadata_dir / "topological_domains.json"
+    domain_f = config.metadata_dir / "topological_domain_assignment.csv"
+
     if not domain_f.exists():
 
         label_domains(
@@ -139,6 +138,12 @@ def get_topological_domain_annotation():
             output_dir=labeling_dir,
             channels=["AQ1", "ColTypeI", "aSMA"],
         )
+
+        #
+        topo_annots = collect_domains(labeling_dir)
+        json.dump(topo_annots, polygon_f.open("w"))
+
+        #
         topo_sc = get_domains_per_cell(topo_annots, prj.rois)
         topo_sc.index = (
             topo_sc.index.get_level_values(1)
@@ -146,6 +151,7 @@ def get_topological_domain_annotation():
             + topo_sc.index.get_level_values(2).astype(str).str.zfill(4)
         )
         topo_sc = topo_sc[["domain_id", "topological_domain"]]
+        topo_sc.to_csv(domain_f.replace_(".csv", ".original.csv"))
 
         # simplify domains and remove some redundancies
         topo_sc["topological_domains"] = topo_sc["topological_domain"]
@@ -168,6 +174,7 @@ def get_topological_domain_annotation():
             domain_f
         )
 
+    topo_annots = json.load(polygon_f.open("r"))
     topo_sc = pd.read_csv(domain_f, index_col=0).replace({"": np.nan})
     return topo_annots, topo_sc
     # topo_sc["topological_domain"].value_counts()

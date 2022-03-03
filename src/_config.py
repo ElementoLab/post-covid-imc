@@ -55,9 +55,7 @@ class config:
         "gender",
     ]
     numeric_attributes = ["age"]
-    # categorical_attributes = [
-    #     a for a in attributes if a not in config.numeric_attributes
-    # ]
+
     attribute_order: tp.Dict[str, tp.List[str]] = dict(
         disease=[
             "Normal",
@@ -164,6 +162,9 @@ class config:
 # Initialize project
 prj = Project(metadata=config.metadata_dir / "samples.csv", name="covid-pasc-imc")
 
+if not prj.rois:
+    raise ValueError("No ROIs in project. Check directories exist!")
+
 # Filter channels and ROIs
 channels = prj.channel_labels.stack().drop_duplicates().reset_index(level=1, drop=True)
 config.channels_exclude = channels.loc[
@@ -240,3 +241,8 @@ if not config.roi_areas_file.exists():
 
 config.roi_areas = pd.read_csv(config.roi_areas_file, index_col=0).squeeze()
 config.sample_areas = pd.read_csv(config.sample_areas_file, index_col=0).squeeze()
+
+
+config.categorical_attributes = [
+    a for a in config.attributes if a not in config.numeric_attributes
+]
