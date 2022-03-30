@@ -4,13 +4,15 @@
 High-level analysis of IMC samples.
 """
 
+import typing as tp
+
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import skimage
 
-from imc.types import Path, Array
+from imc.types import Path, Array, DataFrame
 from imc.graphics import close_plots
 
 from src._config import prj, config
@@ -54,13 +56,13 @@ def quantify_lacunar_space(overwrite: bool = False):
 
 
 def quantify_fibrosis(
-    collagen_channel: str = "ColTypeI(Tm169)", overwrite: bool = False
+    channel: str = "ColTypeI(Tm169)", overwrite: bool = False
 ):
-    f = output_dir / "fibrosis.extent_and_intensity.quantification.csv"
+    f = output_dir / f"fibrosis.extent_and_intensity.{channel}_quantification.csv"
 
     if not f.exists() or overwrite:
         _res = parmap.map(
-            get_extent_and_mean, prj.rois, marker=collagen_channel, pm_pbar=True
+            get_extent_and_mean, prj.rois, marker=channel, pm_pbar=True
         )
         res = pd.DataFrame(
             _res, columns=["extent", "intensity"], index=[r.name for r in prj.rois]
@@ -171,7 +173,8 @@ def get_vessels(
 def get_extent_and_mean(roi: "ROI", marker: str) -> tp.Tuple[float, float]:
     x = np.log1p(roi._get_channel(marker)[1].squeeze())
     area = np.multiply(*roi.shape[1:])
-    return (x > skimage.filters.threshold_otsu(x)).sum() / area, x.mean()
+    mask = skimage.filters.gaussian(x, 2) > skimage.filters.threshold_otsu(x)
+    return mask.sum() / area, x.mean()
 
 
 if __name__ == "__main__" and "get_ipython" not in locals():

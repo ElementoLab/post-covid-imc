@@ -142,20 +142,21 @@ class config:
         "CD68(Pt196)",
     ]
 
-    cell_state_markers = [
-        "iNOS(Nd142)",
-        "uPAR(Nd145)",
-        "p16(Nd150)",
+    config.cell_state_markers = [
         "SARSSpikeS1(Eu153)",
-        "CitH3(Sm154)",
-        "SC5b9(Gd155)",
         "pSTAT3Tyr705(Gd158)",
+        "pNFkbp65(Ho165)",
         "IRF2BP2(Tb159)",
         "IL6(Gd160)",
-        "pNFkbp65(Ho165)",
         "IL1beta(Er166)",
-        # "Ki67(Er168)",
+        "iNOS(Nd142)",
+        "CitH3(Sm154)",
+        "SC5b9(Gd155)",
         "CC3(Yb172)",
+        "Periostin(Dy161)",
+        "p16(Nd150)",
+        "uPAR(Nd145)",
+        # "Ki67(Er168)",
     ]
 
 
@@ -205,6 +206,7 @@ for attr in config.numeric_attributes:
     config.roi_attributes[attr] = config.roi_attributes[attr].astype(float)
 for roi in prj.rois:
     roi.attributes = config.attributes
+config.roi_attributes.to_csv(config.metadata_dir / "roi_attributes.csv")
 
 # # Samples
 sample_names = [x.name for x in prj.samples]
@@ -223,7 +225,7 @@ for df in [config.roi_attributes, config.sample_attributes]:
         df[cat] = pd.Categorical(df[cat], categories=order, ordered=True)
 for sample in prj:
     sample.attributes = config.attributes
-
+config.sample_attributes.to_csv(config.metadata_dir / "sample_attributes.csv")
 
 # Calculate area space
 if not config.roi_areas_file.exists():
