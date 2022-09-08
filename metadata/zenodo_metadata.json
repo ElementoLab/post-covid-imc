@@ -1,0 +1,24 @@
+{
+  "metadata": {
+    "upload_type": "dataset",
+    "title": "Persistent alveolar type 2 dysfunction and lung structural derangement in post-acute COVID-19",
+    "description": "SARS-CoV-2 infection can manifest as a wide range of respiratory and systemic symptoms well after the acute phase of infection in over 50% of patients. Key questions remain on the long-term effect of infection on tissue pathology and on recovered COVID-19 patients. Here we perform multiplexed imaging of post-mortem lung tissue from 12 individuals that died post-acute COVID-19 (PC) and compare them to patients who died during the acute phase of COVID-19, patients who died with idiopathic pulmonary fibrosis (IPF), and otherwise healthy lung. We find evidence of viral presence in the lung up to 359 days after the acute phase of disease, often in patients with negative nasopharyngeal swab test. Our analyses identify accumulation of senescent alveolar type 2 cells, fibrosis with hypervascularization of peribronchial areas and alveolar septa, as the most pronounced pathophysiological features seen in the lung of PC patients. At the cellular level, lung disease of PC patients is distinct from the chronic pulmonary disease of IPF but shares pathological features which may help rationalize interventions for PASC patients. Altogether, this study provides an important ground for the understanding of the long-term effects of SARS-CoV-2 infection at the microanatomical, cellular and molecular level.",
+    "notes": "We make available OME-TIFF files containing raw imaging mass cytometry data for all 23 samples, totaling 175 regions of lung tissue.",
+    "access_right": "closed",
+    "license": "cc-by-nc-4.0",
+    "keywords": [
+      "COVID-19",
+      "PASC",
+      "infection biology",
+      "multiplexed imaging",
+      "single-cell analysis",
+      "spatial-omics"
+    ],
+    "communities": [
+      {
+        "identifier": "covid-19"
+      }
+    ],
+    "language": "eng"
+  }
+}
