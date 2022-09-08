@@ -47,6 +47,10 @@ download_data: ## [TODO!] Download processed data from Zenodo (for reproducibili
 	@echo "Not yet implemented!"
 	python -u src/_download_data.py
 
+start:  ## Start interactive analysis session
+	@echo "Starting interactive IPython session!"
+	python -m IPython -i src/analysis.py
+
 analysis:  ## Run the actual analysis
 	@echo "Running analysis!"
 

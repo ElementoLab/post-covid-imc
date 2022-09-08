@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-High-level analysis of IMC samples.
+Image level analysis of broad pathological features of IMC samples.
 """
 
 import typing as tp
@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import skimage
+import parmap
 
 from imc.types import Path, Array, DataFrame
 from imc.graphics import close_plots
@@ -28,13 +29,59 @@ def main() -> int:
     interpret_metric(lac, "lacunarity")
 
     # Fibrosis
-    fib = quantify_fibrosis()
-    interpret_metric(fib, "fibrosis")
+    fib1 = score_marker(channel="ColTypeI(Tm169)")
+    interpret_metric(fib1, "fibrosis_collagen")
+
+    fib2 = score_marker(channel="Periostin(Dy161)")
+    interpret_metric(fib2, "fibrosis_periostin")
+
+    fib3 = score_marker(channel="CC16(Dy163)")
+    interpret_metric(fib3, "CC16_bleeding")
+    # Check CC16 abundance only in airway ROIS
+    score_compartment_specific(channel="CC16(Dy163)")
+
+    fib4 = score_marker(channel="CitH3(Sm154)")
+    interpret_metric(fib4, "CitH3")
+
+    # Combine both
+    # # weighted by the relative mean of the channels across images
+    chs = ["ColTypeI(Tm169)", "Periostin(Dy161)"]
+    metrics = pd.read_csv(
+        config.results_dir / "roi_channel_stats.csv", index_col=["roi", "channel"]
+    )
+    m = metrics.loc[:, chs, :].groupby("channel")["mean"].mean()
+    r = m[chs[0]] / m[chs[1]]
+
+    fib = pd.concat([fib1, fib2 * r]).groupby(level=0).mean()
+    interpret_metric(fib, "fibrosis_joint")
 
     # Vessels
     # # (CD31, AQP1, aSMA, fill holes)
 
     return 0
+
+
+def score_compartment_specific(
+    channel: str = "CC16(Dy163)",
+    attribute_name: str = "CC16_bleeding_airways",
+    compartment: str = "A",
+    compartment_name="airways",
+):
+    from src.analysis import get_domain_areas
+
+    areas = get_domain_areas()
+
+    f = output_dir / f"extent_and_intensity.{channel}_quantification.csv"
+    if not f.exists():
+        fib = score_marker(channel=channel)
+    fib = pd.read_csv(f, index_col=0)
+
+    interpret_metric(
+        fib.loc[(areas[compartment] > 0)], f"{attribute_name}_{compartment_name}"
+    )
+    interpret_metric(
+        fib.loc[(areas[compartment] == 0)], f"{attribute_name}_non{compartment_name}"
+    )
 
 
 def quantify_lacunar_space(overwrite: bool = False):
@@ -55,15 +102,11 @@ def quantify_lacunar_space(overwrite: bool = False):
     return res
 
 
-def quantify_fibrosis(
-    channel: str = "ColTypeI(Tm169)", overwrite: bool = False
-):
-    f = output_dir / f"fibrosis.extent_and_intensity.{channel}_quantification.csv"
+def score_marker(channel: str = "ColTypeI(Tm169)", overwrite: bool = False):
+    f = output_dir / f"extent_and_intensity.{channel}_quantification.csv"
 
     if not f.exists() or overwrite:
-        _res = parmap.map(
-            get_extent_and_mean, prj.rois, marker=channel, pm_pbar=True
-        )
+        _res = parmap.map(get_extent_and_mean, prj.rois, marker=channel, pm_pbar=True)
         res = pd.DataFrame(
             _res, columns=["extent", "intensity"], index=[r.name for r in prj.rois]
         )
@@ -75,7 +118,7 @@ def quantify_fibrosis(
 
 
 @close_plots
-def interpret_metric(res: DataFrame, metric: str):
+def interpret_metric(res: DataFrame, metric):
 
     # get mean per sample
     res_sample = (
@@ -133,7 +176,7 @@ def get_lacunae(
     # clean up small objects inside
     if fill_holes:
         img = ~ndi.binary_fill_holes(~img)
-        img = ~ski.morphology.remove_small_objects(~img, min_size=min_diam ** 2)
+        img = ~ski.morphology.remove_small_objects(~img, min_size=min_diam**2)
 
     lac = ndi.label(~img)[0]
 
@@ -167,7 +210,7 @@ def get_vessels(
 
     # threshold, close
     img = image > ski.filters.threshold_otsu(image)
-    img = ski.morphology.remove_small_objects(img, min_size=min_diam ** 2)
+    img = ski.morphology.remove_small_objects(img, min_size=min_diam**2)
 
 
 def get_extent_and_mean(roi: "ROI", marker: str) -> tp.Tuple[float, float]:

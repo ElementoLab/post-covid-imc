@@ -142,7 +142,7 @@ class config:
         "CD68(Pt196)",
     ]
 
-    config.cell_state_markers = [
+    cell_state_markers = [
         "SARSSpikeS1(Eu153)",
         "pSTAT3Tyr705(Gd158)",
         "pNFkbp65(Ho165)",
@@ -158,6 +158,22 @@ class config:
         "uPAR(Nd145)",
         # "Ki67(Er168)",
     ]
+
+    topo_labels = {
+        "L-A": "Airway lumen",
+        "A": "Airway",
+        # "A-AR": "Airway",
+        "A-AW": "Airway - airway wall interface",
+        "AW": "Airway wall",
+        "background": "Remaining parenchyma",
+        "AW-M": "Muscle in airway wall",
+        "M": "Muscle",
+        "AR-M": "Muscle in alveolar region",
+        "AR-AW": "Airway wall - alveolar region interface",
+        "AR": "Alveolar region",
+        "AR-V": "Vasculature in alveolar region",
+        "V": "Vasculature",
+    }
 
 
 # Initialize project
@@ -176,6 +192,7 @@ config.channels_include = channels[~channels.isin(config.channels_exclude)]
 
 for roi in prj.rois:
     roi.set_channel_exclude(config.channels_exclude)
+    roi.channel_include = config.channels_include
 
 # Remove ROIs to be excluded
 to_rem = [r for r in prj.rois if r.name in config.roi_exclude_strings]

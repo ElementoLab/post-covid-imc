@@ -5,6 +5,7 @@ Annotation, quantification and interpretation of lung tissue at the topological 
 """
 
 import json
+import typing as tp
 
 import numpy as np
 import pandas as pd
@@ -33,6 +34,9 @@ def main() -> int:
     # Get domains
     topo_annots, topo_sc = get_topological_domain_annotation()
 
+    # Convert polygons to masks, save
+    save_domain_masks(topo_annots)
+
     # Illustrate
     # # simplify vessels
     to_repl = {"Vl": "V", "Vs": "V"}
@@ -48,6 +52,33 @@ def main() -> int:
     )
 
     # Stats
+    # # Count
+    doms = [[r, d["label"]] for r, v in topo_annots.items() for d in v]
+    counts = (
+        pd.DataFrame(doms, columns=["roi", "domain"])
+        .groupby("roi")["domain"]
+        .value_counts()
+        .rename("count")
+    )
+
+    countsp = counts.reset_index().pivot_table(
+        index="roi", columns="domain", values="count", fill_value=0
+    )
+    countsp["V"] = countsp["Vs"] + countsp["Vl"]
+    counts_mm2 = (countsp.T / config.roi_areas).T * 1e6
+
+    fig, stats = swarmboxenplot(
+        data=counts_mm2.join(config.roi_attributes),
+        x="disease_subgroup",
+        y=counts_mm2.columns,
+        plot_kws=dict(palette=config.colors["disease_subgroup"]),
+    )
+    for ax in fig.axes:
+        ax.set(ylabel="Domain count (per mm2)")
+    fig.savefig(
+        output_dir / "domain_distribution.count.mm2.swarmboxenplot.svg", **config.figkws
+    )
+
     # # Area
     areas = get_domain_areas(topo_annots, per_domain=True)
     areas["topological_domains"] = areas["topological_domain"]
@@ -64,10 +95,26 @@ def main() -> int:
         index="roi", columns="topological_domain", values="area", fill_value=0
     )
 
-    ap = (ap.T / config.roi_areas).T * 100
+    ap_perc = (ap.T / config.roi_areas).T * 100
+    ap_mm2 = (ap.T / config.roi_areas).T
+
+    ap_perc.to_csv(output_dir / "domain_distribution.per_roi.perc.csv")
+    ap_mm2.to_csv(output_dir / "domain_distribution.per_roi.mm2.csv")
+
+    fig, stats = swarmboxenplot(
+        data=ap_mm2.join(config.roi_attributes),
+        x="disease_subgroup",
+        y=ap.columns,
+        plot_kws=dict(palette=config.colors["disease_subgroup"]),
+    )
+    for ax in fig.axes:
+        ax.set(ylabel="Domain area (mm2)")
+    fig.savefig(
+        output_dir / "domain_distribution.area.mm2.swarmboxenplot.svg", **config.figkws
+    )
 
     grid = clustermap(
-        ap,
+        ap_mm2,
         config="abs",
         row_colors=config.roi_attributes[config.colors.keys()],
         row_colors_cmaps=config.colors.values(),
@@ -77,7 +124,7 @@ def main() -> int:
         output_dir / "domain_distribution.clustermap.abs.svg", **config.figkws
     )
     grid = clustermap(
-        ap,
+        ap_mm2,
         config="z",
         row_colors=config.roi_attributes[config.colors.keys()],
         row_colors_cmaps=config.colors.values(),
@@ -116,7 +163,8 @@ def main() -> int:
     )
     fig.savefig(output_dir / "domain_count.per_mm2.svg", **config.figkws)
 
-    # # Intensity per marker
+    # # Intensity per markerCO
+    quantify_domains(topo_annots, prj.rois)
 
     # Interactions
 
@@ -180,6 +228,35 @@ def get_topological_domain_annotation():
     # topo_sc["topological_domain"].value_counts()
 
 
+def save_domain_masks(topo_annots: dict[str, list[str, tp.Any]]) -> None:
+    domain_classes = pd.Series(
+        dict(
+            enumerate(
+                sorted(
+                    np.unique([x["label"] for _, d in topo_annots.items() for x in d])
+                ),
+                1,
+            )
+        )
+    )
+    domain_classes.rename_axis(index="index").rename("class").to_csv(
+        config.results_dir / "domains" / "domain_classes_encoding.csv"
+    )
+    for roi_name in tqdm(topo_annots):
+        roi = [r for r in prj.rois if r.name == roi_name][0]
+        out_f = (
+            config.processed_dir / roi.sample.name / "tiffs" / roi_name
+            + "_domain_mask.tiff"
+        )
+        msk = get_domain_mask(topo_annots[roi.name], roi, per_domain=True)
+        mask = np.zeros(msk.shape, dtype="uint8")
+        for i, c in domain_classes.iteritems():
+            mask[msk == c] = i
+        tifffile.imwrite(
+            out_f, data=mask, metadata={"class_labels": domain_classes.to_dict()}
+        )
+
+
 def quantify_domains(topo_annots, rois):
     import parmap
 
@@ -195,6 +272,7 @@ def quantify_domains(topo_annots, rois):
     )
     quant = pd.concat([y for x in _quant for y in x])
     quant.to_csv(output_dir / "domain_expression.csv")
+    quant = pd.read_csv(output_dir / "domain_expression.csv", index_col=0)
 
     quant["topological_domain"] = (
         quant.index.to_series()
@@ -208,12 +286,25 @@ def quantify_domains(topo_annots, rois):
 
     for dom in mean_s.index.levels[1]:
         fig, stats = swarmboxenplot(
-            data=mean_s.loc[:, dom, :], x="disease_subgroup", y=config.channels_include
+            data=mean_s.loc[:, dom, :],
+            x="disease_subgroup",
+            y=config.channels_include,
+            plot_kws=dict(palette=config.colors["disease_subgroup"]),
         )
-        fig.savefig(output_dir / f"domain_expression.{dom}.swarmboxenmplot.svg")
+        fig.savefig(
+            output_dir / f"domain_expression.{dom}.swarmboxenplot.svg", **config.figkws
+        )
 
     mean_t = quant.groupby(["topological_domain"]).mean()[config.channels_include]
     grid = clustermap((mean_t - mean_t.mean()) / mean_t.std(), config="abs")
+
+    p = (
+        mean_s.reset_index()
+        .groupby(["topological_domain", "disease_subgroup"])
+        .mean()
+        .dropna()
+    )
+    grid = clustermap((p - p.mean()) / p.std(), config="abs")
 
 
 def _quantify_domains_roi(roi, topo_annots, label_order):

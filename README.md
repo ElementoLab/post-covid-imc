@@ -1,4 +1,4 @@
-# IMC of patients with post-acute sequelae of COVID-19
+# Multiplexed imaging of patients with post-acute COVID-19
 
 [![Zenodo badge](https://zenodo.org/badge/doi/___doi1___.svg)](https://doi.org/___doi1___)
 
@@ -14,9 +14,6 @@ Project description
 - Raw data (i.e. MCD files) will be under the `data` directory.
 - Processing of the data will create files under the `processed`  directory.
 - Outputs from the analysis will be present in a `results` directory, with subfolders pertaining to each part of the analysis as described below.
-
-Raw data in the form of MCD are hosted on WCM's enterprise version of Box.com. An account is needed to download the files, which can be made programmatically with the [imctransfer](https://github.com/ElementoLab/imctransfer) program.
-For now you'll need a developer token to connect to box.com programmatically. Place the credentials in a JSON file in `~/.imctransfer.auth.json`. Be sure to make the file read-only (e.g. `chmod 400 ~/.imctransfer.auth.json`).
 
 ## Reproducibility
 
@@ -52,7 +49,5 @@ $ make analysis       # run the analysis scripts
 
 #### Requirements
 
-- Python 3.8+
+- Python 3.10+
 - Python packages as specified in the [requirements file](requirements.txt) - install with `make requirements` or `pip install -r requirements.txt`.
-
-Feel free to use some virtualization or compartimentalization software such as virtual environments or conda to install the requirements.

@@ -19,31 +19,9 @@ from src._config import prj, config
 from src.domains import get_topological_domain_annotation
 
 
-# TODO:
-# - [x] segment lacunae
-# - [x] segment/quantify fibrosis
-# - [ ] segment vessels (or use manual annotations)
-# - [ ] segment NETs
-# - [ ] quantify CitH3 in vessels
-# - [x] label domains
-# - [x] illustrate domains
-# - [ ] domain interaction
-# - [x] phenotype in relation to domains
-# - [ ] cell type distance to domains
-# - [x] cell type interaction
-# - [ ] subcellular quantification (nuclear vs rest)
-# - [ ] cleanup signal in cell state markers, observe in light of cell type identity
-# - [ ] sub-cluster T cell, myeloid compartments
-
-
-# - [ ] segment periostin, quantify cell types in Periostin, quantify distance to Periostin per cell type
-
-
 def main() -> int:
     assert all(r.get_input_filename("stack").exists() for r in prj.rois)
     assert all(r.get_input_filename("cell_mask").exists() for r in prj.rois)
-
-    topo_annots, topo_sc = get_topological_domain_annotation()
 
     # filter_noise()
 
@@ -51,10 +29,672 @@ def main() -> int:
     illustrate()
     qc()
     phenotype()
+
+    periostin_interactions()
+    cith3_ammount()
+    marker_positivity()
+    infected_cells()
+
+    increased_diversity(
+        prefix="myeloid",
+        cois=[
+            "Monocytes",
+            "Macrophages",
+            "Peribronchial Macrophages",
+            "CD16+ inflammatory monocytes",
+            "Dendritic cells",
+        ],
+        resolution=3.0,
+    )
+    increased_diversity(
+        prefix="tcell",
+        cois=["Peribronchial CD4 T", "Peribronchial CD8 T", "CD8 T"],
+        resolution=3.0,
+    )
+    increased_diversity(
+        prefix="stroma",
+        cois=["Fibroblasts", "Basal", "Mesenchymal"],
+        resolution=3.0,
+    )
+
     cellular_interactions()
-    unsupervised()
+
+    # unsupervised(
+    #     add_expression=False,
+    #     regress_out=False,
+    #     scale=False,
+    #     prefix="noscale.noregout.abundance",
+    #     corrmaps=True,
+    # )
+    unsupervised(
+        add_expression=False,
+        regress_out=True,
+        scale=True,
+        prefix="scale.regout.abundance",
+        corrmaps=True,
+    )
+    unsupervised(
+        add_expression=True,
+        regress_out=True,
+        scale=True,
+        prefix="scale.regout.mixed_abundance_expression",
+        corrmaps=True,
+    )
+
+    contrast_coefficients()
 
     return 0
+
+
+def get_domain_areas(as_percentage: bool = True):
+    from shapely.geometry import Polygon
+
+    topo_annots, topo_sc = get_topological_domain_annotation()
+    _areas = dict()
+    for roi in topo_annots:
+        top_areas = {
+            dom["label"]: Polygon(dom["points"]).area for dom in topo_annots[roi]
+        }
+        top_areas["total"] = config.roi_areas[roi]
+        _areas[roi] = top_areas
+
+    areas = (
+        pd.DataFrame(_areas)
+        .fillna(0)
+        .drop("total")
+        .T.rename_axis(index="roi")
+        .sort_index()
+    )
+    if as_percentage:
+        areas = (areas.T / areas.sum(1)).T * 100
+    return areas
+
+
+def qc_signal():
+    _metrics = list()
+    for r in tqdm(prj.rois):
+        df = pd.DataFrame(
+            [
+                r.stack.mean((1, 2)).tolist(),
+                r.stack.var((1, 2)).tolist(),
+                r.channel_labels.tolist(),
+                [r.name] * r.channel_labels.shape[0],
+            ],
+            index=["mean", "var", "channel", "roi"],
+        ).T
+        _metrics.append(df)
+    metrics = pd.concat(_metrics)
+    for col in ["mean", "var"]:
+        metrics[col] = metrics[col].astype(float)
+    metrics.to_csv(config.results_dir / "roi_channel_stats.csv", index=False)
+    # metrics = metrics.join(config.roi_attributes)
+
+    fig, axes = plt.subplots(6, 8, figsize=(3 * 8, 3 * 6), sharex=False, sharey=False)
+    for i, (ax, ch) in enumerate(zip(fig.axes, r.channel_labels)):
+        p = metrics.query(f"channel == '{ch}'").set_index("roi")[["mean", "var"]]
+        ax.scatter(p["mean"], p["var"], alpha=0.75, s=3)
+        # for s in p.index:
+        #     ax.text(p.loc[s, 'mean'], p.loc[s, 'var'], s=s)
+        v = p["mean"].max()
+        b = p["mean"].min()
+        for cv in [1, 10, 100]:
+            ax.plot((b, v), (b * cv, v * cv), linestyle="--", color="grey")
+        ax.set(title=ch)
+        ax.loglog()
+    for ax in fig.axes[i + 1 :]:
+        ax.axis("off")
+
+    metrics["cv"] = np.sqrt(metrics["var"]) / metrics["mean"]
+    metricsp = metrics.pivot_table(index="roi", columns="channel", values="cv")
+
+    grid = clustermap(np.log1p(metricsp))
+
+    _res = list()
+    for r in tqdm(prj.rois):
+        r.channel_labels.iloc[23]
+        ch = np.log1p(r.stack[23])
+        ft = np.fft.fftshift(np.fft.fft2(ch))
+        _res.append(ft)
+
+        fig, axes = plt.subplots(1, 2)
+        axes[0].imshow(r.stack[23])
+        axes[1].imshow(np.log(abs(ft)))
+
+    res = np.asarray(_res)
+    plt.scatter(metricsp.iloc[:, 23], [abs(x).mean() for x in res])
+
+    metricsp["fft"] = [abs(x).mean() for x in res]
+
+    fig, stats = swarmboxenplot(
+        data=metricsp.join(config.roi_attributes), x="disease_subgroup", y="fft"
+    )
+
+
+def sars_detection_and_pathology():
+    from imc.graphics import get_grid_dims
+
+    a = sc.read(config.results_dir / "phenotyping" / "processed.labeled.h5ad")
+    a.obs["covid"] = a.obs["disease"].isin(["COVID-19", "Mixed", "Convalescent"])
+
+    output_dir = config.results_dir / "pathology"
+    output_prefix = output_dir / "overlap_IMC_pathology."
+    cell_type_label = "cell_type_label_3.5"
+    grouping = "sample"
+
+    exp = (
+        a.to_df()
+        .join(a.obs[[cell_type_label, grouping]])
+        .groupby([cell_type_label, grouping])
+        .mean()
+    )
+    path = pd.read_csv("metadata/samples.pathology_tests.csv", index_col=0).replace(
+        [None], np.nan, regex=False
+    )
+    cols = path.columns[path.columns.str.startswith("lung")]
+    path["lung_positive"] = False
+    path.loc[path.loc[:, cols].isnull().all(1), "lung_positive"] = np.nan
+    path.loc[path.loc[:, cols].any(1), "lung_positive"] = True
+
+    p = (
+        exp.reset_index()
+        .pivot_table(
+            index="sample", columns=cell_type_label, values="SARSSpikeS1(Eu153)"
+        )
+        .join(getattr(config, f"{grouping}_attributes"))
+        .query("disease == 'Convalescent'")
+        .join(path["lung_positive"])
+    )
+
+    fig, stats = swarmboxenplot(data=p, x="lung_positive", y=exp.index.levels[0])
+    for ax in fig.axes:
+        ax.set(ylabel="SARSSpikeS1(Eu153)", xlabel="SARS Spike positivity (ISH, IHC)")
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
+    fig.savefig(output_prefix + "swarmboxenplot.yaxis_flexible.svg", **config.figkws)
+
+    fig, stats = swarmboxenplot(
+        data=p, x="lung_positive", y=exp.index.levels[0], fig_kws=dict(sharey=True)
+    )
+    for ax in fig.axes:
+        ax.set(
+            ylabel="SARSSpikeS1(Eu153)",
+            xlabel="SARS Spike positivity (ISH, IHC)",
+            ylim=(0, 1.8),
+        )
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
+    fig.savefig(output_prefix + "swarmboxenplot.yaxis_fixed.svg", **config.figkws)
+
+    stats.to_csv(output_prefix + "stats.csv")
+    stats = pd.read_csv(output_prefix + "stats.csv")
+
+    fig, ax = plt.subplots()
+    stats["mean"] = stats[["median_A", "median_B"]].mean(1)
+    sns.regplot(x=stats["mean"], y=stats["hedges"] * -1, scatter=False, ax=ax)
+    res = pg.corr(x=stats["mean"], y=stats["hedges"] * -1).squeeze()
+    ax.scatter(stats["mean"], stats["hedges"] * -1)
+    v = stats["hedges"].abs().max()
+    v += v * 0.1
+    ax.set(
+        xlabel="Mean SARSSpikeS1 expression",
+        ylabel="Agreement IMC vs IHC/ISH (fold enrichment)",
+        ylim=(-v, v),
+        title=f"r = {res['r']}; p = {res['p-val']}",
+    )
+    ax.axhline(0, linestyle="--", color="grey")
+    for _, row in stats.iterrows():
+        ax.text(row["mean"], row["hedges"] * -1, s=row["Variable"])
+    ax.axvline(1, linestyle="--", color="grey")
+    fig.savefig(output_prefix + "agreement_hedges.scatterplot.svg", **config.figkws)
+
+    perc = (a.obs["cell_type_label_3.5"].value_counts() / a.obs.shape[0]) * 100
+    sel = perc[perc >= 1].index
+
+    stats = stats.loc[stats["Variable"].isin(sel), :]
+    fig, ax = plt.subplots()
+    stats["mean"] = stats[["median_A", "median_B"]].mean(1)
+    sns.regplot(x=stats["mean"], y=stats["hedges"] * -1, scatter=False, ax=ax)
+    res = pg.corr(x=stats["mean"], y=stats["hedges"] * -1).squeeze()
+    ax.scatter(stats["mean"], stats["hedges"] * -1)
+    v = stats["hedges"].abs().max()
+    v += v * 0.1
+    ax.set(
+        xlabel="Mean SARSSpikeS1 expression",
+        ylabel="Agreement IMC vs IHC/ISH (fold enrichment)",
+        ylim=(-v, v),
+        title=f"r = {res['r']}; p = {res['p-val']}",
+    )
+    ax.axhline(0, linestyle="--", color="grey")
+    for _, row in stats.iterrows():
+        ax.text(row["mean"], row["hedges"] * -1, s=row["Variable"])
+    ax.axvline(1, linestyle="--", color="grey")
+    ax.set(xlim=(-0.05, 2.05))
+    fig.savefig(
+        output_prefix + "agreement_hedges.scatterplot.filtered_1%.svg", **config.figkws
+    )
+
+    p = (
+        exp.reset_index()
+        .pivot_table(
+            index="sample", columns=cell_type_label, values="SARSSpikeS1(Eu153)"
+        )
+        .join(getattr(config, f"{grouping}_attributes"))
+        .join(path["lung_positive"])
+    )
+    p["infected"] = False
+    p.loc[p["Alveolar type 2"] > 1.4, "infected"] = True
+    classification = p[["disease_subgroup", "infected"]].copy()
+    classification["infected"] = pd.Categorical(
+        classification["infected"], ordered=True
+    )
+
+    a = sc.read(config.results_dir / "phenotyping" / "processed.labeled.h5ad")
+    a.obs["covid"] = a.obs["disease"].isin(["COVID-19", "Mixed", "Convalescent"])
+
+    output_dir = config.results_dir / "pathology"
+    output_prefix = output_dir / "overlap_IMC_pathology."
+    cell_type_label = "cell_type_label_3.5"
+    grouping = "roi"
+
+    counts = a.obs.groupby([grouping])[[cell_type_label]].value_counts().rename("count")
+    counts_mm2 = (
+        ((counts / getattr(config, f"{grouping}_areas") * 1e6))
+        .rename("cells_per_mm2")
+        .to_frame()
+        .pivot_table(
+            index=grouping,
+            columns=cell_type_label,
+            values="cells_per_mm2",
+            fill_value=0,
+        )
+    )
+    p = counts_mm2.join(
+        getattr(config, f"{grouping}_attributes")
+    )  # .query("disease_subgroup.str.startswith('COVID-19-long')", engine='python')
+    # fig, ax = plt.subplots()
+    # ax.scatter(p['disease_subgroup'].cat.codes, p['Alveolar type 2'])
+    p = p.merge(classification[["infected"]], left_on="sample", right_index=True)
+    fig, stats = swarmboxenplot(data=p, x="infected", y=counts_mm2.columns)
+    fig.savefig(
+        output_prefix + "regrouped_by_SARS_IMC_intensity.swarmboxenplot.by_sample.svg",
+        **config.figkws,
+    )
+
+    # p.index = p.index.str.extract(r"(.*)-\d+")[0].rename("sample")
+
+    fig, stats = swarmboxenplot(data=p, x="infected", y=counts_mm2.columns)
+    fig.savefig(
+        output_prefix + "regrouped_by_SARS_IMC_intensity.swarmboxenplot.by_roi.svg",
+        **config.figkws,
+    )
+
+    p["disease_subgroup_reordered"] = p["disease_subgroup"]
+    p.loc[
+        p["disease_subgroup"].str.startswith("COVID-19-long") & (p["infected"] == True),
+        "disease_subgroup_reordered",
+    ] = "COVID-19-long-neg"
+    p.loc[
+        p["disease_subgroup"].str.startswith("COVID-19-long")
+        & (p["infected"] == False),
+        "disease_subgroup_reordered",
+    ] = False
+    fig, stats = swarmboxenplot(
+        data=p, x="disease_subgroup_reordered", y=counts_mm2.columns
+    )
+    fig.savefig(
+        output_prefix
+        + "regrouped_by_SARS_IMC_intensity.swarmboxenplot.by_roi.all_subgroups.svg",
+        **config.figkws,
+    )
+
+
+def abundance_and_pathology():
+    a = sc.read(config.results_dir / "phenotyping" / "processed.labeled.h5ad")
+    a.obs["covid"] = a.obs["disease"].isin(["COVID-19", "Mixed", "Convalescent"])
+
+    output_dir = config.results_dir / "pathology"
+    output_prefix = output_dir / "overlap_IMC_pathology."
+    cell_type_label = "cell_type_label_3.5"
+    grouping = "roi"
+
+    counts = a.obs.groupby([grouping])[[cell_type_label]].value_counts().rename("count")
+    counts_mm2 = (
+        ((counts / getattr(config, f"{grouping}_areas") * 1e6))
+        .rename("cells_per_mm2")
+        .to_frame()
+        .pivot_table(
+            index=grouping,
+            columns=cell_type_label,
+            values="cells_per_mm2",
+            fill_value=0,
+        )
+    )
+    p = counts_mm2.join(getattr(config, f"{grouping}_attributes")).query(
+        "disease_subgroup.str.startswith('COVID-19-long')", engine="python"
+    )
+
+    path = pd.read_csv("metadata/samples.pathology_tests.csv", index_col=0).replace(
+        [None], np.nan, regex=False
+    )
+    cols = path.columns[path.columns.str.startswith("lung")]
+    path["lung_positive"] = False
+    path.loc[path.loc[:, cols].isnull().all(1), "lung_positive"] = np.nan
+    path.loc[path.loc[:, cols].any(1), "lung_positive"] = True
+    cols = path.columns[path.columns.str.startswith("trachea")]
+    path["trachea_positive"] = False
+    path.loc[path.loc[:, cols].isnull().all(1), "trachea_positive"] = np.nan
+    path.loc[path.loc[:, cols].any(1), "trachea_positive"] = True
+
+    p = p.merge(path, left_index=True, right_index=True, how="left")
+
+    fig, stats = swarmboxenplot(data=p, x="lung_positive", y=counts_mm2.columns)
+    for ax in fig.axes:
+        ax.set(ylabel="cells per mm2", xlabel="SARS Spike positivity (ISH, IHC)")
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
+    fig.savefig(
+        output_prefix
+        + "reassignment_based_on_pathology.cell_abundance.swarmboxenplot.svg",
+        **config.figkws,
+    )
+
+    # # Macs
+    # roi_name = 'A20_77_A27-02'
+    # roi_name = 'A20_185_A33_v1-07'
+    # roi = [r for r in prj.rois if r.name == roi_name][0]
+    # fig = roi.plot_channels(['CD163', 'CD206', 'ColTypeI', 'K818'], equalize=False, minmax=False, log=True, merged=True, smooth=0.5)
+    # fig.savefig(config.results_dir / 'illustration' / roi.name + ".markers.merged.svg", **config.figkws)
+
+
+def contrast_coefficients():
+    from matplotlib.patches import Circle
+    import statsmodels.api as sm
+    import statsmodels.formula.api as smf
+
+    output_dir = (config.results_dir / "temporal").mkdir()
+
+    a = sc.read(config.results_dir / "phenotyping" / "processed.labeled.h5ad")
+    a.obs["covid"] = a.obs["disease"].isin(["COVID-19", "Mixed", "Convalescent"])
+
+    meta = pd.read_csv(config.metadata_dir / "samples.csv", index_col=0).rename_axis(
+        "sample"
+    )
+
+    cell_type_label = "cell_type_label_3.5"
+    var = "days_since_first_infection"
+    # var = "age"
+    for grouping in ["sample", "roi"]:
+        attrs = getattr(config, grouping + "_attributes")
+        attrs = (
+            attrs.reset_index()
+            .merge(meta.reset_index()[["sample", var]], how="left")
+            .set_index(grouping)
+        )
+        counts = (
+            a.obs.groupby([grouping])[[cell_type_label]].value_counts().rename("count")
+        )
+        counts_mm2 = (
+            ((counts / getattr(config, f"{grouping}_areas") * 1e6))
+            .rename("cells_per_mm2")
+            .to_frame()
+            .pivot_table(
+                index=grouping,
+                columns=cell_type_label,
+                values="cells_per_mm2",
+                fill_value=0,
+            )
+        )
+        data = counts_mm2.join(attrs[[var]]).dropna()
+        x = data.drop(var, axis=1)
+        y = data[[var]]
+
+        x = (x - x.mean()) / x.std()
+        y = (y - y.mean()) / y.std()
+        model = sm.GLM(y, x.assign(Intercept=1)).fit()
+        model.summary2()
+        res = pd.DataFrame([model.params, model.pvalues], index=["hedges", "p-unc"]).T
+        res.to_csv(
+            output_dir / f"regression.{var}.cells_per_mm2.GLM.per_{grouping}.csv"
+        )
+        res = pd.read_csv(
+            output_dir / f"regression.{var}.cells_per_mm2.GLM.per_{grouping}.csv",
+            index_col=0,
+        )
+
+        res = res.sort_values("hedges").drop("Intercept")
+
+        fig, ax = plt.subplots(figsize=(4 * 1.1, 4))
+        v = res["hedges"].abs().max()
+        v += v * 0.1
+        ax.scatter(
+            res["hedges"],
+            res.index,
+            s=5 + 5 ** (-np.log10(res["p-unc"])),
+            c=res["hedges"],
+            cmap="coolwarm",
+            vmin=-v,
+            vmax=v,
+            edgecolor="black",
+            alpha=0.75,
+        )
+        ax.axvline(0, linestyle="--", color="grey")
+        ps = [1e-0, 1e-1, 1e-2, 1e-3][::-1]
+        ax.scatter(
+            [0] * len(ps),
+            [0] * len(ps),
+            s=5 + 5 ** (-np.log10(ps)),
+            edgecolor="black",
+            alpha=0.75,
+            color="orange",
+        )
+        fig.savefig(
+            output_dir
+            / f"regression.{var}.cells_per_mm2.GLM.per_{grouping}.scatter.rank_vs_value.svg",
+            **config.figkws,
+        )
+
+        # counts_perc = (
+        #     ((counts / counts.groupby(level=0).sum()))
+        #     .rename("cells_percent")
+        #     .to_frame()
+        #     .pivot_table(
+        #         index=grouping,
+        #         columns=cell_type_label,
+        #         values="cells_percent",
+        #         fill_value=0,
+        #     )
+        # )
+        # data = counts_perc.join(meta[[var]]).dropna()
+        # x = data.drop(var, axis=1)
+        # y = data[[var]] / data[[var]].sum()
+
+        # model = sm.GLM(y, x, family=sm.families.Gamma(sm.families.links.Log())).fit()
+
+    # Using coefficients from comparing groups (phenotype function)
+    fr = (
+        config.results_dir
+        / "phenotyping"
+        / "clustering.cell_type_label_3.5.swarmboxenplot.by_roi_and_disease.area.no_mixed.stats.csv"
+    )
+    stats1 = pd.read_csv(fr)
+    fs = (
+        config.results_dir
+        / "phenotyping"
+        / "clustering.cell_type_label_3.5.swarmboxenplot.by_roi_and_disease_subgroup.area.no_mixed.stats.csv"
+    )
+    stats2 = pd.read_csv(fs)
+    stats = stats1.append(stats2)
+
+    pairs = [
+        [
+            ("Normal", "UIP/IPF"),
+            ("Normal", "COVID-19"),
+            (-1, -1),
+        ],
+        [
+            ("Normal", "COVID-19"),
+            ("Normal", "Convalescent"),
+            (-1, -1),
+        ],
+        [
+            ("Normal", "COVID-19"),
+            ("COVID-19", "Convalescent"),
+            (-1, -1),
+        ],
+        [
+            ("COVID-19", "Convalescent"),
+            ("COVID-19-long-pos", "COVID-19-long-neg"),
+            (-1, 1),
+        ],
+        [
+            ("COVID-19-early", "COVID-19-late"),
+            ("COVID-19-long-pos", "COVID-19-long-neg"),
+            (1, 1),
+        ],
+        [
+            ("Normal", "COVID-19"),
+            ("COVID-19-early", "COVID-19-long-pos"),
+            (-1, -1),
+        ],
+        [
+            ("Normal", "COVID-19"),
+            ("COVID-19-late", "COVID-19-long-pos"),
+            (-1, -1),
+        ],
+        [
+            ("Normal", "COVID-19"),
+            ("COVID-19-early", "COVID-19-long-neg"),
+            (-1, -1),
+        ],
+        [
+            ("Normal", "COVID-19"),
+            ("COVID-19-late", "COVID-19-long-neg"),
+            (-1, -1),
+        ],
+        [
+            ("Normal", "COVID-19"),
+            ("COVID-19", "Convalescent"),
+            (-1, -1),
+        ],
+        [
+            ("Normal", "COVID-19-long-pos"),
+            ("COVID-19-long-pos", "COVID-19-long-neg"),
+            (-1, 1),
+        ],
+        [
+            ("Normal", "COVID-19-long-neg"),
+            ("COVID-19-long-pos", "COVID-19-long-neg"),
+            (-1, -1),
+        ],
+    ]
+
+    fig, axes = plt.subplots(
+        1, len(pairs), figsize=(4 * len(pairs) * 1.1, 4), squeeze=False
+    )
+    for ax, (pair1, pair2, changes) in zip(fig.axes, pairs):
+        a1 = (
+            stats.query(f"A == '{pair1[0]}' & B == '{pair1[1]}'")
+            .set_index("Variable")
+            .groupby(level=0)
+            .mean()
+        )
+        a1["hedges"] *= changes[0]
+        b1 = (
+            stats.query(f"A == '{pair2[0]}' & B == '{pair2[1]}'")
+            .set_index("Variable")
+            .groupby(level=0)
+            .mean()
+        )
+        b1["hedges"] *= changes[1]
+
+        ps = pd.concat([a1["p-unc"], b1["p-unc"]], axis=1).min(1)
+        # v = pd.concat([a1["hedges"], b1["hedges"]]).abs().max()
+        v = 2.2
+        v += v * 0.1
+        ax.scatter(
+            a1["hedges"],
+            b1["hedges"],
+            s=5 + 3 ** (-np.log10(ps)),
+            c=(a1["hedges"] * b1["hedges"]),
+            cmap="coolwarm",
+            vmin=-1,
+            vmax=1,
+            edgecolor="black",
+            alpha=0.75,
+        )
+        ax.axhline(0, linestyle="--", color="grey")
+        ax.axvline(0, linestyle="--", color="grey")
+        # ax.set(xlim=(-v, v), ylim=(-v, v))
+        for s in a1.index:
+            ax.text(a1.loc[s, "hedges"], b1.loc[s, "hedges"], s=s)
+        ax.set(
+            xlabel=f"Fold change ({pair1[0]} vs {pair1[1]})"
+            if changes[0] == 1
+            else f"Fold change ({pair1[1]} vs {pair1[0]})",
+            ylabel=f"Fold change ({pair2[0]} vs {pair2[1]})"
+            if changes[0] == 1
+            else f"Fold change ({pair2[1]} vs {pair2[0]})",
+        )
+    ps = [1e-0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6][::-1]
+    fig.axes[-1].scatter(
+        [0] * len(ps),
+        [0] * len(ps),
+        s=5 + 3 ** (-np.log10(ps)),
+        edgecolor="black",
+        alpha=0.75,
+        color="orange",
+    )
+    fig.savefig(
+        # output_dir / "coefficient_comparison.pairs.scatter.fixed_axes.svg",
+        output_dir / "coefficient_comparison.pairs.scatter.flexible_axes.svg",
+        **config.figkws,
+    )
+
+    # Compare coefficient from regressing time vs comparing groups
+    fig, ax = plt.subplots(figsize=(4 * 1 * 1.1, 4))
+    a1 = (
+        stats.query(f"A == 'COVID-19-long-pos' & B == 'COVID-19-long-neg'")
+        .set_index("Variable")
+        .groupby(level=0)
+        .mean()
+    )
+    b1 = res.sort_index()
+    ps = pd.concat([a1["p-unc"], b1["p-unc"]], axis=1).min(1)
+    v = 2.2
+    v += v * 0.1
+    ax.scatter(
+        a1["hedges"],
+        b1["hedges"],
+        s=5 + 3 ** (-np.log10(ps)),
+        c=(a1["hedges"] * b1["hedges"]),
+        cmap="coolwarm",
+        vmin=-1,
+        vmax=1,
+        edgecolor="black",
+        alpha=0.75,
+    )
+    sns.regplot(a1["hedges"], b1["hedges"], ax=ax, scatter=False, color="grey")
+    ax.axhline(0, linestyle="--", color="grey")
+    ax.axvline(0, linestyle="--", color="grey")
+    # ax.set(xlim=(-v, v), ylim=(-v, v))
+    for s in a1.index:
+        ax.text(a1.loc[s, "hedges"], b1.loc[s, "hedges"], s=s)
+    ax.set(
+        xlabel=f"Fold change (PASC-neg vs PASC-pos)",
+        ylabel=f"Fold change (time since onset)",
+    )
+    ps = [1e-0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6][::-1]
+    fig.axes[-1].scatter(
+        [0] * len(ps),
+        [0] * len(ps),
+        s=5 + 3 ** (-np.log10(ps)),
+        edgecolor="black",
+        alpha=0.75,
+        color="orange",
+    )
+    fig.savefig(
+        output_dir / "coefficient_comparison.group_vs_time.scatter.flexible_axes.svg",
+        **config.figkws,
+    )
+
+    # TODO: regress out time per cell type in expression of markers
 
 
 def filter_noise():
@@ -319,8 +959,6 @@ def filter_noise_sc():
         # df.loc[:, df.columns.isin([chb])] = (
         #     df.loc[:, df.columns.isin([chb])].values - df.loc[:, df.columns.isin(cha)].values
         # )
-
-
     a.X[a.X < 0] = 0
 
     sc.pp.scale(a)
@@ -551,6 +1189,129 @@ def cohort_characteristics():
         plt.close(fig)
 
 
+def cohort_temporal_visualization():
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+    import matplotlib.patches as patches
+
+    output_dir = (config.results_dir / "cohort").mkdir()
+
+    df = pd.read_csv(config.metadata_dir / "samples.csv", index_col=0)
+    df = df.query(
+        "disease.isin(['Convalescent', 'Mixed'])", engine="python"
+    ).sort_values("date_first_infection")
+
+    for col in df.columns[df.columns.str.startswith("date_")]:
+        if df[col].str.contains("-").any():
+            continue
+        df[col] = pd.to_datetime(df[col])
+
+    # colors = config.colors["disease_subgroup"][-2:]
+
+    s = plt.rcParams["lines.markersize"] ** 2
+    fig, ax = plt.subplots(figsize=(8, 3))
+    i = 0
+    # for subgroup, color in zip(df['disease_subgroup'].unique(), colors):
+    # df2 = df.query(f"disease_subgroup == '{subgroup}'")
+    for (
+        pid,
+        row,
+    ) in df.iterrows():
+        ax.plot(
+            (row["date_first_infection"], row["date_death"]),
+            (i, i),
+            color="grey",
+            linestyle="--",
+            zorder=-1000,
+        )
+        ax.scatter(
+            row["date_first_infection"],
+            i - 0,
+            s=s + s * 0.1,
+            color="purple",
+            marker="s",
+        )
+        ax.scatter(row["date_death"], i + 0, s=s + s * 0.1, color="red", marker="s")
+
+        # Negative tests
+        for date in pd.to_datetime(row["dates_neg_tests"].split(",")):
+            ax.scatter(date, i, s=s, color="green", edgecolors="black", alpha=0.8)
+        # Positive tests
+        for date in pd.to_datetime(row["dates_pos_tests"].split(",")):
+            ax.scatter(date, i, s=s, color="orange", edgecolors="black", alpha=0.8)
+        # Additional events
+        if row["dates_events"] != "":
+            for event in row["dates_events"].split(","):
+                date, desc = event.split("-")
+                ax.scatter(pd.to_datetime(date), i, color="grey", marker="x", s=s / 2)
+                ax.text(pd.to_datetime(date), i + 0.1, s=desc)
+        i += 1
+    ax.set_yticks(range(df.shape[0]))
+    ax.set_yticklabels(df["alternative_id"])
+    ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%Y-%m"))
+
+    # rect = patches.Rectangle((pd.to_datetime(""), 100), 40, 30, linewidth=1, edgecolor='r', facecolor='none')
+    # ax.add_patch(rect)
+    x, y = (
+        pd.to_datetime("2021/03/01"),
+        pd.to_datetime("2021/07/01"),
+        pd.to_datetime("2021/07/01"),
+        pd.to_datetime("2021/03/01"),
+        pd.to_datetime("2021/03/01"),
+    ), (6 + 0.5, 6 + 0.5, 10 + 0.5, 10 + 0.5, 6 + 0.5)
+    ax.plot(x, y, linestyle="--", color="black", alpha=0.5, linewidth=0.5)
+
+    ax2 = inset_axes(ax, "50%", "35%", loc="upper left")
+    for (
+        pid,
+        row,
+    ) in df.iloc[-4:].iterrows():
+        ax2.plot(
+            (row["date_first_infection"], row["date_death"]),
+            (i, i),
+            color="grey",
+            linestyle="--",
+            zorder=-1000,
+        )
+        ax2.scatter(
+            row["date_first_infection"],
+            i - 0,
+            s=s + s * 0.1,
+            color="purple",
+            marker="s",
+        )
+        ax2.scatter(row["date_death"], i + 0, s=s + s * 0.1, color="red", marker="s")
+
+        # Negative tests
+        for date in pd.to_datetime(row["dates_neg_tests"].split(",")):
+            ax2.scatter(date, i, s=s, color="green", edgecolors="black", alpha=0.8)
+        # Positive tests
+        for date in pd.to_datetime(row["dates_pos_tests"].split(",")):
+            ax2.scatter(date, i, s=s, color="orange", edgecolors="black", alpha=0.8)
+        # Additional events
+        if row["dates_events"] != "":
+            for event in row["dates_events"].split(","):
+                date, desc = event.split("-")
+                ax2.scatter(pd.to_datetime(date), i, color="grey", marker="x", s=s / 2)
+                ax2.text(pd.to_datetime(date), i + 0.1, s=desc)
+        i += 1
+    ax2.set_xticks(
+        [
+            pd.to_datetime("2021/04/01"),
+            pd.to_datetime("2021/05/01"),
+            pd.to_datetime("2021/06/01"),
+        ]
+    )
+    ax2.set_xticklabels(ax2.get_xticklabels(), fontsize=8)
+    ax2.set_yticklabels([])
+    ax2.margins(0.05, 0.15)
+    ax2.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%Y-%m"))
+    for axis in ["top", "bottom", "left", "right"]:
+        ax2.spines[axis].set(linewidth=0.5, linestyle="--", alpha=0.5)
+    fig.savefig(
+        output_dir / "cohort_timeline.convalescent_patients.svg", **config.figkws
+    )
+
+
 def phenotype() -> None:
     output_dir = config.results_dir / "phenotyping"
 
@@ -582,6 +1343,8 @@ def phenotype() -> None:
     _, topo_sc = get_topological_domain_annotation()
     a.obs = a.obs.join(topo_sc["topological_domain"])
 
+    a.uns["disease_subgroup_colors"] = config.colors["disease_subgroup"]
+
     # Plot
     chs = a.var.index[~a.var.index.isin(config.channels_exclude)].tolist()
     vmax = pd.Series([np.percentile(a.raw[:, c].X, 95) for c in chs], index=chs)
@@ -599,18 +1362,23 @@ def phenotype() -> None:
     fig.savefig(output_dir / "umap.marker_expression.svg", **config.figkws)
     plt.close(fig)
 
+    _a = a[a.obs.sample(frac=1).index, :]
     clusters = a.obs.columns[a.obs.columns.str.startswith("cluster_")].tolist()
-    fig = sc.pl.umap(a, color=clusters, show=False)[0].figure
+    fig = sc.pl.umap(_a, color=clusters, ncols=1, show=False)[0].figure
     rasterize_scanpy(fig)
     fig.savefig(output_dir / "umap.clusters.svg", **config.figkws)
     plt.close(fig)
 
-    _a = a[a.obs.sample(frac=1).index, :]
     fig = sc.pl.umap(
-        _a, color="topological_domain", show=False, s=5, alpha=0.25, palette="tab20"
+        _a,
+        color="disease_subgroup",
+        ncols=1,
+        show=False,
+        s=5,
+        alpha=0.25,
     ).figure
     rasterize_scanpy(fig)
-    fig.savefig(output_dir / "umap.topological_domain.svg", **config.figkws)
+    fig.savefig(output_dir / "umap.disease_subgroup.svg", **config.figkws)
     plt.close(fig)
 
     _a = a[a.obs.sample(frac=1).index, :]
@@ -623,9 +1391,10 @@ def phenotype() -> None:
     clusters = a.obs.columns[a.obs.columns.str.startswith("cluster_")].tolist()
     cluster = "cluster_3.5"
     for cluster in clusters:
-        means = a.to_df().groupby(a.obs[cluster]).mean()
+        b = a[a.obs["disease_subgroup"] == "Normal", :]
+        means = b.to_df().groupby(a.obs[cluster]).mean()
         means = means.loc[:, means.std() > 0]
-        sizes = a.to_df().groupby(a.obs[cluster]).size().rename("cell_count")
+        sizes = b.to_df().groupby(a.obs[cluster]).size().rename("cell_count")
 
         grid = clustermap(
             means.loc[:, means.columns.isin(config.channels_include)],
@@ -748,7 +1517,7 @@ def phenotype() -> None:
         )
         plt.close(grid4.fig)
 
-        c = a.obs.groupby(cluster)[["topological_domain"]].value_counts()
+        c = b.obs.groupby(cluster)[["topological_domain"]].value_counts()
         c = c[c > 50].rename("count")
 
         pc = c.reset_index().pivot_table(
@@ -882,7 +1651,7 @@ def phenotype() -> None:
         # plot cell abundance
         for grouping in ["roi", "sample"]:
             counts = (
-                a.obs.groupby(grouping)[f"cell_type_label_{resolution}"]
+                a.obs.groupby(grouping)[[f"cell_type_label_{resolution}"]]
                 .value_counts()
                 .rename("count")
             )
@@ -912,17 +1681,25 @@ def phenotype() -> None:
                     **config.figkws,
                 )
                 plt.close(fig)
+                stats.to_csv(
+                    output_dir
+                    / f"clustering.cell_type_label_{resolution}.swarmboxenplot.by_{grouping}_and_{attr}.area.stats.csv",
+                    index=False,
+                )
 
             p = p.query("disease != 'Mixed'")
             p["disease"] = p["disease"].cat.remove_unused_categories()
             p["disease_subgroup"] = p["disease_subgroup"].cat.remove_unused_categories()
             # color not matched!
             for attr in config.colors:
+                colors = config.colors[attr].copy()
+                if attr == "disease_subgroup":
+                    colors = np.delete(colors, 4, axis=0)
                 fig, stats = swarmboxenplot(
                     data=p,
                     x=attr,
                     y=counts_mm2.columns,
-                    plot_kws=dict(palette=config.colors[attr]),
+                    plot_kws=dict(palette=colors),
                     # fig_kws=dict(figsize=(4, 12)),
                 )
                 fig.savefig(
@@ -931,6 +1708,12 @@ def phenotype() -> None:
                     **config.figkws,
                 )
                 plt.close(fig)
+
+                stats.to_csv(
+                    output_dir
+                    / f"clustering.cell_type_label_{resolution}.swarmboxenplot.by_{grouping}_and_{attr}.area.no_mixed.stats.csv",
+                    index=False,
+                )
 
         labs = pd.Series(
             [
@@ -1073,88 +1856,306 @@ def phenotype() -> None:
     a.write(output_dir / "processed.labeled.h5ad")
 
 
+def differential_location():
+    output_dir = (config.results_dir / "domains" / "differential_location").mkdir()
+    a = sc.read(config.results_dir / "phenotyping" / "processed.labeled.h5ad")
+    cluster = "cell_type_label_3.5"
+
+    order = [
+        "L-A",
+        "A",
+        "A-AW",
+        "AW",
+        "background",
+        "AW-M",
+        "M",
+        "AR-M",
+        "AR",
+        "AR-V",
+        "V",
+    ]
+
+    c = (
+        a.obs.groupby(["disease_subgroup", cluster, "roi"])[["topological_domain"]]
+        .value_counts()
+        .rename("count")
+        .reorder_levels([0, 2, 3, 1])
+    )
+    t = (
+        a.obs.groupby(["disease_subgroup", "roi"])[["topological_domain"]]
+        .value_counts()
+        .rename("total")
+    )
+    c = (c / t).rename("fraction")  # .reorder_levels([0, 2, 1])
+
+    pc = c.reset_index().pivot_table(
+        index=["roi", "disease_subgroup", cluster],
+        columns="topological_domain",
+        fill_value=0,
+        values="fraction",
+        aggfunc="mean",
+    )
+    pt = (pc.T / pc.sum(1)).T.fillna(0) * 100
+
+    grid = clustermap(pt.groupby(level=cluster).mean(), config="abs")
+    grid = clustermap(pt.groupby(level=cluster).mean(), config="z")
+    grid.fig.savefig(
+        output_dir / f"domain_proportions.clustermap.by_celltype.svg", **config.figkws
+    )
+
+    ptg = pt.groupby(level=[cluster, "disease_subgroup"]).mean()
+    ptg = (
+        ptg.loc[:, config.attribute_order["disease_subgroup"], :]
+        .drop("Mixed", level=1)
+        .sort_index(level=0, sort_remaining=False)
+        .loc[:, order]
+    )
+    grid = clustermap(
+        ptg,
+        config="abs",
+        row_cluster=False,
+        col_cluster=False,
+        row_colors=ptg.index.to_frame(),
+        yticklabels=True,
+    )
+    ptgz = ptg / ptg.sum()
+    ptgz = (ptgz.T / ptgz.sum(1)).T
+    grid = clustermap(
+        ptgz,
+        config="abs",
+        row_cluster=False,
+        col_cluster=False,
+        row_colors=ptg.index.to_frame(),
+        yticklabels=True,
+    )
+    grid.fig.savefig(
+        output_dir / f"domain_proportions.clustermap.sorted.svg", **config.figkws
+    )
+
+    # ptz = (pt - pt.mean()) / pt.std()
+    ptz = pt
+
+    _stats = list()
+    for ct in tqdm(pt.index.levels[2]):
+        d = ptz.loc[:, :, ct, :].reset_index()
+        d["disease_subgroup"] = pd.Categorical(
+            d["disease_subgroup"],
+            ordered=True,
+            categories=config.attribute_order["disease_subgroup"],
+        )
+        fig, stats = swarmboxenplot(
+            data=d,
+            x="disease_subgroup",
+            y=pt.columns,
+            plot_kws=dict(palette=config.colors["disease_subgroup"]),
+        )
+        fig.savefig(
+            output_dir / f"domain_proportions.{ct}.swarmboxenmplot.svg", **config.figkws
+        )
+        _stats.append(stats.assign(cell_type=ct))
+    stats = pd.concat(_stats)
+
+    q = (
+        stats.sort_values("hedges")
+        .dropna()
+        .query(
+            "A != 'Mixed' & B != 'Mixed' & A != 'UIP/IPF' & B != 'UIP/IPF' & Variable.isin(['A', 'AR', 'V']).values"
+        )
+    )
+    q.query("cell_type == 'CD16+ inflammatory monocytes'")
+    q.query("cell_type == 'Alveolar type 2'")
+
+    grid = clustermap(pt, config="z", row_colors=pt.index.to_frame())
 
 
-def infected_cells(a: AnnData) -> AnnData:
+def illustrate_CC16_secretion_bleeding():
+    # "A18_19_A19-02"
+    rois = ["S19_6699_B9-01", "S20_1842_A7-05", "A20_79_A23-08", "A20_100_A28-09"]
+    for roi_name in rois:
+        roi = [r for r in prj.rois if r.name == roi_name][0]
+        fig = roi.plot_channels(
+            ["AQ1", "CC16", "ColTypeI"],
+            equalize=True,
+            minmax=False,
+            log=True,
+            merged=True,
+            smooth=1,
+        )
+        fig.axes[0].set_title(roi.disease_subgroup)
+        fig.savefig(
+            config.results_dir
+            / "illustration"
+            / f"CC16_secretion_bleeding.{roi.name}.svg",
+            **config.figkws,
+        )
+
+
+def illustrate_CitH3_NETs():
+    rois = ["A20_77_A27-04", "A20_77_A27-03", "A20_185_A33_v1-01"]
+    for roi_name in rois:
+        roi = [r for r in prj.rois if r.name == roi_name][0]
+        fig = roi.plot_channels(
+            # ["K818", "MPO", "ColTypeI", "CitH3"],
+            # ["MPO", "CitH3", "ColTypeI", 'uPAR', 'CD31'],
+            ["MPO", "CitH3", "ColTypeI", "CD31"],
+            target_colors=["yellow", "red", "green", "blue"],
+            equalize=True,
+            minmax=False,
+            log=True,
+            merged=True,
+            smooth=1,
+        )
+        fig.axes[0].set_title(roi.disease_subgroup)
+        fig.savefig(
+            config.results_dir / "illustration" / f"CitH3_NETs.{roi.name}.svg",
+            **config.figkws,
+        )
+
+
+def infected_cells() -> AnnData:
     output_dir = (config.results_dir / "positivity").mkdir()
 
     a = sc.read(config.results_dir / "phenotyping" / "processed.labeled.h5ad")
-    a.obs['covid'] = a.obs['disease'].isin(['COVID-19', 'Mixed', 'Convalescent'])
+    a.obs["covid"] = a.obs["disease"].isin(["COVID-19", "Mixed", "Convalescent"])
+
+    col = "SARSSpikeS1(Eu153)"
+    a.X[~a.obs["covid"], a.var.index == col] *= 0.8
+    a.raw.X[~a.obs["covid"], a.raw.var.index == col] *= 0.8
+    a.write(config.results_dir / "phenotyping" / "processed.labeled.signalfix.h5ad")
 
     # Conditional scalling approach
     # # Shrink SARS signal in non-COVID samples, find a threshold which maximizes separation
     df = np.log1p(a.raw.to_adata().to_df())
     # df = a.to_df()
-    col = 'SARSSpikeS1(Eu153)'
+    col = "SARSSpikeS1(Eu153)"
     _res = list()
     for f in tqdm(np.linspace(1, 0, 50)):
         df2 = df.copy()
-        df2.loc[~a.obs['covid'], col] *= f
+        df2.loc[~a.obs["covid"], col] *= f
         for t in np.linspace(0, 5, 50):
             pos = df2[col] > t
-            p = pos.groupby(a.obs['covid']).sum()
-            n = pos.groupby(a.obs['covid']).size()
+            p = pos.groupby(a.obs["covid"]).sum()
+            n = pos.groupby(a.obs["covid"]).size()
             _res.append([f, t, p[True], p[False], n[True], n[False]])
-    res = pd.DataFrame(_res, columns=['shrinkage_factor', 'threshold', 'pos_COVID', 'pos_NON', 'n_COVID', 'n_NON'])
-    res['frac_COVID'] = res['pos_COVID'] / res['n_COVID']
-    res['frac_NON'] = res['pos_NON'] / res['n_NON']
-    res['log_ratio'] = np.log((res['pos_COVID'] / res['n_COVID']) / (res['pos_NON'] / res['n_NON']))
+    res = pd.DataFrame(
+        _res,
+        columns=[
+            "shrinkage_factor",
+            "threshold",
+            "pos_COVID",
+            "pos_NON",
+            "n_COVID",
+            "n_NON",
+        ],
+    )
+    res["frac_COVID"] = res["pos_COVID"] / res["n_COVID"]
+    res["frac_NON"] = res["pos_NON"] / res["n_NON"]
+    res["log_ratio"] = np.log(
+        (res["pos_COVID"] / res["n_COVID"]) / (res["pos_NON"] / res["n_NON"])
+    )
 
-    vmax = res[res != np.inf]['log_ratio'].max() * 0.95
-    _p = res.pivot_table(index='shrinkage_factor', columns='threshold', values='log_ratio').iloc[1:, 1:]
+    vmax = res[res != np.inf]["log_ratio"].max() * 0.95
+    _p = res.pivot_table(
+        index="shrinkage_factor", columns="threshold", values="log_ratio"
+    ).iloc[1:, 1:]
     _p.index = _p.index.to_series().round(2)
     _p.columns = _p.columns.to_series().round(2)
     fig, ax = plt.subplots()
-    sns.heatmap(_p, vmax=vmax, ax=ax, cbar_kws=dict(label='log(COVID / non-COVID) SARSSpikeS1+ cells'))
-    fig.savefig(output_dir / 'SARSSpikeS1_thresholds.svg')
+    sns.heatmap(
+        _p,
+        vmax=vmax,
+        ax=ax,
+        cbar_kws=dict(label="log(COVID / non-COVID) SARSSpikeS1+ cells"),
+    )
+    fig.savefig(output_dir / "SARSSpikeS1_thresholds.svg")
 
     # Choose parameters: shrink 0.8, threshold 1.0
-    df.loc[~a.obs['covid'], col] *= 0.8
+    df.loc[~a.obs["covid"], col] *= 0.8
     pos = df[col] > thresholds[col]
     a.obs[col + "_pos"] = pos
 
-    a.obs.groupby(pos)['covid'].value_counts()
+    a.obs.groupby(pos)["covid"].value_counts()
 
-    counts = a.obs.groupby(['roi', 'cell_type_label_3.5'])[col + "_pos"].value_counts()
+    counts = a.obs.groupby(["roi", "cell_type_label_3.5"])[col + "_pos"].value_counts()
     counts_mm2 = (counts / config.roi_areas) * 1e6
-    counts_perc = (counts / a.obs.groupby('roi').size()) * 100
+    counts_perc = (counts / a.obs.groupby("roi").size()) * 100
 
-    for group in ['disease', 'disease_subgroup']:
-        for df, label in [(counts_mm2, 'mm2'), (counts_perc, 'perc')]:
+    for group in ["disease", "disease_subgroup"]:
+        for df, label in [(counts_mm2, "mm2"), (counts_perc, "perc")]:
             p = df[:, :, True].rename(col + "_pos").to_frame()
-            pp = p.pivot_table(index='roi', columns='cell_type_label_3.5', values=col + "_pos", fill_value=0)
-            fig, stats = swarmboxenplot(data=pp.join(config.roi_attributes), x=group, y=pp.columns, plot_kws=dict(palette=config.colors[group]))
-            fig.savefig(output_dir / f"SARSSpikeS1_positivity.by_{group}.{label}.swarmboxenplot.svg", **config.figkws)
+            pp = p.pivot_table(
+                index="roi",
+                columns="cell_type_label_3.5",
+                values=col + "_pos",
+                fill_value=0,
+            )
+            fig, stats = swarmboxenplot(
+                data=pp.join(config.roi_attributes),
+                x=group,
+                y=pp.columns,
+                plot_kws=dict(palette=config.colors[group]),
+            )
+            fig.savefig(
+                output_dir
+                / f"SARSSpikeS1_positivity.by_{group}.{label}.swarmboxenplot.svg",
+                **config.figkws,
+            )
             plt.close(fig)
 
             ppp = pp.join(config.roi_attributes[[group]]).groupby(group).mean().T
-            grid = clustermap(ppp, col_cluster=False, square=True, cbar_kws=dict(label=label))
-            grid.savefig(output_dir / f"SARSSpikeS1_positivity.by_{group}.{label}.clustermap.svg", **config.figkws)
+            grid = clustermap(
+                ppp, col_cluster=False, square=True, cbar_kws=dict(label=label)
+            )
+            grid.savefig(
+                output_dir
+                / f"SARSSpikeS1_positivity.by_{group}.{label}.clustermap.svg",
+                **config.figkws,
+            )
             plt.close(grid.fig)
 
-    q = counts_perc[:, 'Alveolar type 2', True].to_frame("pos").join(config.roi_attributes).query("disease == 'Convalescent'")
-    q['disease_subgroup'] = q['disease_subgroup'].cat.remove_unused_categories()
-    fig, stats = swarmboxenplot(data=q, x='disease_subgroup', y="pos")
+    q = (
+        counts_perc[:, "Alveolar type 2", True]
+        .to_frame("pos")
+        .join(config.roi_attributes)
+        .query("disease == 'Convalescent'")
+    )
+    q["disease_subgroup"] = q["disease_subgroup"].cat.remove_unused_categories()
+    fig, stats = swarmboxenplot(data=q, x="disease_subgroup", y="pos")
 
     # Plot
-    q = a.obs.groupby(pos)['cell_type_label_3.5'].value_counts()[True] / a.obs['cell_type_label_3.5'].value_counts()
+    q = (
+        a.obs.groupby(pos)["cell_type_label_3.5"].value_counts()[True]
+        / a.obs["cell_type_label_3.5"].value_counts()
+    )
 
-    ct = a.obs.groupby(pos)['cell_type_label_3.5'].value_counts() / a.obs.groupby(pos)['cell_type_label_3.5'].size() # / a.obs['cell_type_label_3.5'].value_counts()
+    ct = (
+        a.obs.groupby(pos)["cell_type_label_3.5"].value_counts()
+        / a.obs.groupby(pos)["cell_type_label_3.5"].size()
+    )  # / a.obs['cell_type_label_3.5'].value_counts()
     fig, axes = plt.subplots(1, 2, figsize=(8, 4), sharex=True, sharey=False)
     o = ct[True].sort_values(ascending=False).index
-    sns.barplot(x=ct[False].reindex(o), y=o, ax=axes[0], orient='horiz')
-    sns.barplot(x=ct[True], y=o, ax=axes[1], orient='horiz')
-    axes[0].set(title='SARS-CoV-2 Spike neg')
-    axes[1].set(title='SARS-CoV-2 Spike pos')
-    fig.savefig(output_dir / 'SARSSpikeS1_infected.per_cell_type.svg', **config.figkws)
+    sns.barplot(x=ct[False].reindex(o), y=o, ax=axes[0], orient="horiz")
+    sns.barplot(x=ct[True], y=o, ax=axes[1], orient="horiz")
+    axes[0].set(title="SARS-CoV-2 Spike neg")
+    axes[1].set(title="SARS-CoV-2 Spike pos")
+    fig.savefig(output_dir / "SARSSpikeS1_infected.per_cell_type.svg", **config.figkws)
 
-    ct_cov = a.obs.query("covid").groupby(pos)['cell_type_label_3.5'].value_counts() / a.obs.query("covid").groupby(pos)['cell_type_label_3.5'].size()
-    ct_non = a.obs.query("~covid").groupby(pos)['cell_type_label_3.5'].value_counts() / a.obs.query("~covid").groupby(pos)['cell_type_label_3.5'].size()
+    ct_cov = (
+        a.obs.query("covid").groupby(pos)["cell_type_label_3.5"].value_counts()
+        / a.obs.query("covid").groupby(pos)["cell_type_label_3.5"].size()
+    )
+    ct_non = (
+        a.obs.query("~covid").groupby(pos)["cell_type_label_3.5"].value_counts()
+        / a.obs.query("~covid").groupby(pos)["cell_type_label_3.5"].size()
+    )
 
     _res2 = list()
     for t in np.linspace(0, 5, 50):
         pos = val > t
-        ct = a.obs.groupby(pos)['cell_type_label_3.5'].value_counts() / a.obs.groupby(pos)['cell_type_label_3.5'].size()
+        ct = (
+            a.obs.groupby(pos)["cell_type_label_3.5"].value_counts()
+            / a.obs.groupby(pos)["cell_type_label_3.5"].size()
+        )
         if True in ct.index:
             _res2.append(ct[True].rename(t))
     res2 = pd.DataFrame(_res2)
@@ -1162,40 +2163,71 @@ def infected_cells(a: AnnData) -> AnnData:
     res2.index = res2.index.to_series().round(2)
     fig, ax = plt.subplots()
     sns.heatmap(res2, ax=ax)
-    fig.savefig(output_dir / 'SARSSpikeS1_thresholds_per_cell_type.svg', **config.figkws)
+    fig.savefig(
+        output_dir / "SARSSpikeS1_thresholds_per_cell_type.svg", **config.figkws
+    )
 
     fig, ax = plt.subplots()
     sns.heatmap((res2 - res2.mean()) / res2.std(), ax=ax)
-    fig.savefig(output_dir / 'SARSSpikeS1_thresholds_per_cell_type.zscore.svg', **config.figkws)
-
+    fig.savefig(
+        output_dir / "SARSSpikeS1_thresholds_per_cell_type.zscore.svg", **config.figkws
+    )
 
     # compare phenotype of infected vs non-infected per cell type
-    _v = [col + "_pos",'cell_type_label_3.5']
+    _v = [col + "_pos", "cell_type_label_3.5"]
     df = a.raw.to_adata().to_df()
     df = np.log1p((df.T / df.sum(1)).T * 1e4)
     df2 = df
     # df2 = df.loc[a.obs['disease'] == 'Convalescent', :]
-    
+
     aggs = df2.join(a.obs[_v]).groupby(_v).mean()
-    diff = (aggs.loc[True, :, :] - aggs.loc[False, :, :])[config.cell_state_markers]# .drop(col, axis=1)
+    diff = (aggs.loc[True, :, :] - aggs.loc[False, :, :])[
+        config.cell_state_markers
+    ]  # .drop(col, axis=1)
     # diff = diff[[x for x in config.channels_include if x in diff.columns]]
 
     ns = df2.join(a.obs[_v]).groupby(_v).size()
 
     diff = diff.loc[:, diff.mean(0).sort_values().index]
 
-    grid = clustermap(diff, cmap='RdBu_r', center=0, col_cluster=True, cbar_kws=dict(label="log fold change (SARSSpikeS1+/SARSSpikeS1-)"), row_colors=ns[False].to_frame("neg").join(ns[True].rename('pos')), config='abs', figsize=(2, 4))
-    grid.savefig(output_dir / 'SARSSpikeS1_positivity.change_in_expression.clustermap.svg', **config.figkws)
+    grid = clustermap(
+        diff,
+        cmap="RdBu_r",
+        center=0,
+        col_cluster=True,
+        cbar_kws=dict(label="log fold change (SARSSpikeS1+/SARSSpikeS1-)"),
+        row_colors=ns[False].to_frame("neg").join(ns[True].rename("pos")),
+        config="abs",
+        figsize=(2, 4),
+    )
+    grid.savefig(
+        output_dir / "SARSSpikeS1_positivity.change_in_expression.clustermap.svg",
+        **config.figkws,
+    )
 
-    for ct in sorted(a.obs['cell_type_label_3.5'].unique()):
-        df3 = df.loc[(a.obs['cell_type_label_3.5'] == ct) & ~a.obs['disease_subgroup'].isin(['Normal', 'UIP/IPF'])]
-        p = df3.join(a.obs[['disease_subgroup', col + "_pos"]])
-        p['disease_subgroup'] = p['disease_subgroup'].cat.remove_unused_categories()
+    for ct in sorted(a.obs["cell_type_label_3.5"].unique()):
+        df3 = df.loc[
+            (a.obs["cell_type_label_3.5"] == ct)
+            & ~a.obs["disease_subgroup"].isin(["Normal", "UIP/IPF"])
+        ]
+        p = df3.join(a.obs[["disease_subgroup", col + "_pos"]])
+        p["disease_subgroup"] = p["disease_subgroup"].cat.remove_unused_categories()
 
-        fig, axes = plt.subplots(3, 4, figsize=(4 * 2, 3 * 4), sharex=True, sharey=True, gridspec_kw=dict(wspace=0, hspace=0))
-        for ax, marker in zip(axes.flat, [x for x in config.cell_state_markers if x != col]):
-            sns.violinplot(data=p, x='disease_subgroup', y=marker, hue=col + "_pos", ax=ax)
-            ax.set(xlabel='', ylabel='')
+        fig, axes = plt.subplots(
+            3,
+            4,
+            figsize=(4 * 2, 3 * 4),
+            sharex=True,
+            sharey=True,
+            gridspec_kw=dict(wspace=0, hspace=0),
+        )
+        for ax, marker in zip(
+            axes.flat, [x for x in config.cell_state_markers if x != col]
+        ):
+            sns.violinplot(
+                data=p, x="disease_subgroup", y=marker, hue=col + "_pos", ax=ax
+            )
+            ax.set(xlabel="", ylabel="")
             ax.set_title(marker, y=0.9)
         for ax in axes[-1, :]:
             ax.set_xticklabels(ax.get_xticklabels(), rotation=90)
@@ -1203,31 +2235,38 @@ def infected_cells(a: AnnData) -> AnnData:
             l = ax.get_legend()
             if l:
                 l.set_visible(False)
-        t = p.groupby(['disease_subgroup', col + "_pos"]).size()
-        fig.suptitle(ct + "\nn = " + '; '.join(t.astype(str)))
-        fig.savefig(output_dir / f"SARSSpikeS1_positivity.change_in_expression.{ct.replace(' ', '_')}.violinplot.svg", **config.figkws)
+        t = p.groupby(["disease_subgroup", col + "_pos"]).size()
+        fig.suptitle(ct + "\nn = " + "; ".join(t.astype(str)))
+        fig.savefig(
+            output_dir
+            / f"SARSSpikeS1_positivity.change_in_expression.{ct.replace(' ', '_')}.violinplot.svg",
+            **config.figkws,
+        )
         plt.close(fig)
 
 
-def marker_positivity(a: AnnData) -> AnnData:
+def marker_positivity() -> AnnData:
     output_dir = (config.results_dir / "positivity").mkdir()
 
     a = sc.read(config.results_dir / "phenotyping" / "processed.labeled.h5ad")
-    a.obs['covid'] = a.obs['disease'].isin(['COVID-19', 'Mixed', 'Convalescent'])
+    a.obs["covid"] = a.obs["disease"].isin(["COVID-19", "Mixed", "Convalescent"])
 
     # df = np.log1p(a.raw.to_adata().to_df())
     df = a.raw.to_adata().to_df()
     df = np.log1p((df.T / df.sum(1)).T * 1e4)
 
-    col = 'SARSSpikeS1(Eu153)'
-    df.loc[~a.obs['covid'], col] *= 0.8
+    col = "SARSSpikeS1(Eu153)"
+    df.loc[~a.obs["covid"], col] *= 0.8
 
     thresholds = dict()
     for col in tqdm(sorted(config.cell_state_markers)):
         _res2 = list()
         for t in np.linspace(0, df[col].max(), 50):
             pos = df[col] > t
-            ct = a.obs.groupby(pos)['cell_type_label_3.5'].value_counts() / a.obs.groupby(pos)['cell_type_label_3.5'].size()
+            ct = (
+                a.obs.groupby(pos)["cell_type_label_3.5"].value_counts()
+                / a.obs.groupby(pos)["cell_type_label_3.5"].size()
+            )
             if True in ct.index:
                 _res2.append(ct[True].rename(t))
         res2 = pd.DataFrame(_res2)
@@ -1235,68 +2274,219 @@ def marker_positivity(a: AnnData) -> AnnData:
         res2.index = res2.index.to_series().round(2)
         fig, ax = plt.subplots()
         sns.heatmap(res2, ax=ax)
-        fig.savefig(output_dir / f'{col}_thresholds_per_cell_type.svg', **config.figkws)
+        fig.savefig(output_dir / f"{col}_thresholds_per_cell_type.svg", **config.figkws)
 
         fig, ax = plt.subplots()
         sns.heatmap((res2 - res2.mean()) / res2.std(), ax=ax)
-        fig.savefig(output_dir / f'{col}_thresholds_per_cell_type.zscore.svg', **config.figkws)
+        fig.savefig(
+            output_dir / f"{col}_thresholds_per_cell_type.zscore.svg", **config.figkws
+        )
 
         # threshold
         from imc.ops.mixture import get_population
+
         pos = get_population(df[col])
         thresholds[col] = df.loc[pos, col].min()
         # pos = (df[col] > 1)
         a.obs[col + "_pos"] = pos
 
-        counts = a.obs.groupby(['roi', 'cell_type_label_3.5'])[col + "_pos"].value_counts()
+        counts = a.obs.groupby(["roi", "cell_type_label_3.5"])[
+            col + "_pos"
+        ].value_counts()
         counts_mm2 = (counts / config.roi_areas) * 1e6
-        counts_perc = (counts / a.obs.groupby('roi').size()) * 100
+        counts_perc = (counts / a.obs.groupby("roi").size()) * 100
 
-        for group in ['disease', 'disease_subgroup']:
-            for df2, label in [(counts_mm2, 'mm2'), (counts_perc, 'perc')]:
-                if True not in df2.index.levels[2]: continue
+        for group in ["disease", "disease_subgroup"]:
+            for df2, label in [(counts_mm2, "mm2"), (counts_perc, "perc")]:
+                if True not in df2.index.levels[2]:
+                    continue
                 p = df2[:, :, True].rename(col + "_pos").to_frame()
-                pp = p.pivot_table(index='roi', columns='cell_type_label_3.5', values=col + "_pos", fill_value=0)
-                fig, stats = swarmboxenplot(data=pp.join(config.roi_attributes), x=group, y=pp.columns, plot_kws=dict(palette=config.colors[group]))
-                fig.savefig(output_dir / f"{col}_positivity.by_{group}.{label}.swarmboxenplot.svg", **config.figkws)
+                pp = p.pivot_table(
+                    index="roi",
+                    columns="cell_type_label_3.5",
+                    values=col + "_pos",
+                    fill_value=0,
+                )
+                fig, stats = swarmboxenplot(
+                    data=pp.join(config.roi_attributes),
+                    x=group,
+                    y=pp.columns,
+                    plot_kws=dict(palette=config.colors[group]),
+                )
+                fig.savefig(
+                    output_dir
+                    / f"{col}_positivity.by_{group}.{label}.swarmboxenplot.svg",
+                    **config.figkws,
+                )
                 plt.close(fig)
 
-                ppp = pp.join(config.roi_attributes[[group]]).groupby(group).mean().T.fillna(0)
-                if ppp.shape[0] < 2: continue
-                grid = clustermap(ppp, col_cluster=False, square=True, cbar_kws=dict(label=label))
-                grid.savefig(output_dir / f"{col}_positivity.by_{group}.{label}.clustermap.svg", **config.figkws)
+                ppp = (
+                    pp.join(config.roi_attributes[[group]])
+                    .groupby(group)
+                    .mean()
+                    .T.fillna(0)
+                )
+                if ppp.shape[0] < 2:
+                    continue
+                grid = clustermap(
+                    ppp, col_cluster=False, square=True, cbar_kws=dict(label=label)
+                )
+                grid.savefig(
+                    output_dir / f"{col}_positivity.by_{group}.{label}.clustermap.svg",
+                    **config.figkws,
+                )
                 plt.close(grid.fig)
 
                 order = pp.mean().sort_values(ascending=False)
-                _tp = pp.reset_index().melt(id_vars='roi')
+                _tp = pp.reset_index().melt(id_vars="roi")
                 fig, ax = plt.subplots(figsize=(2, 4))
-                sns.barplot(data=_tp, x='value', y='cell_type_label_3.5', ax=ax, order=order.index, color=sns.color_palette()[0])
-                fig.savefig(output_dir / f"{col}_positivity.by_{group}.{label}.barplot.svg", **config.figkws)
+                sns.barplot(
+                    data=_tp,
+                    x="value",
+                    y="cell_type_label_3.5",
+                    ax=ax,
+                    order=order.index,
+                    color=sns.color_palette()[0],
+                )
+                fig.savefig(
+                    output_dir / f"{col}_positivity.by_{group}.{label}.barplot.svg",
+                    **config.figkws,
+                )
                 plt.close(fig)
 
+    pd.Series(thresholds).to_csv(output_dir / "positivity_thresholds.csv")
 
-    pd.Series(thresholds).to_csv(output_dir / 'positivity_thresholds.csv')
+    thresholds = (
+        pd.read_csv(output_dir / "positivity_thresholds.csv", index_col=0)
+        .squeeze()
+        .to_dict()
+    )
 
     # Positivity across all cell types and markers
     pos = pd.DataFrame(index=df.index, columns=thresholds)
     for m, t in thresholds.items():
         pos[m] = df[m] > t
-    g = pos.join(a.obs[['roi', 'cell_type_label_3.5']]).groupby(['roi', 'cell_type_label_3.5'])
+    g = pos.join(a.obs[["roi", "cell_type_label_3.5"]]).groupby(
+        ["roi", "cell_type_label_3.5"]
+    )
     p = g.sum()
     c = g.size()
-    perc = pd.DataFrame([(p[col] / c).rename(col) for col in pos.columns]).T.fillna(0) * 100
-    mm2 = pd.DataFrame([(p[col] / config.roi_areas).rename(col) for col in pos.columns]).T.fillna(0) * 1e6
+    perc = (
+        pd.DataFrame([(p[col] / c).rename(col) for col in pos.columns]).T.fillna(0)
+        * 100
+    )
+    mm2 = (
+        pd.DataFrame(
+            [(p[col] / config.roi_areas).rename(col) for col in pos.columns]
+        ).T.fillna(0)
+        * 1e6
+    )
 
-    for group in ['disease', 'disease_subgroup']:
-        for df2, label in [(mm2, 'mm2'), (perc, 'perc')]:
-            p = df2.join(config.roi_attributes[group]).reset_index().groupby([group, 'cell_type_label_3.5']).mean().reset_index()
-            pp = p.pivot_table(index='cell_type_label_3.5', columns=group)
-            grid = clustermap(pp, cbar_kws=dict(label=label), col_cluster=False, square=True, config='abs')
-            grid.savefig(output_dir / f"all_markers_positivity.by_{group}.{label}.clustermap.abs.svg", **config.figkws)
+    perc.to_csv(output_dir / "positivity_per_cell_type.percentage.csv")
+    mm2.to_csv(output_dir / "positivity_per_cell_type.area.csv")
+
+    # # Global view
+    # m = perc.reset_index().melt(id_vars=["roi", "cell_type_label_3.5"])
+    # p = m.pivot_table(
+    #     index=["cell_type_label_3.5", "variable"], columns=["roi"], values="value"
+    # )
+    # p = ((p.T - p.mean(1)) / p.std(1)).T
+    # p = (p - p.mean()) / p.std()
+    # grid = clustermap(p.corr(), row_colors=config.roi_attributes[['disease_subgroup', 'sample']], cmap='coolwarm', vmin=-1, vmax=1)
+    # grid.savefig(output_dir / "positivity.similarity.roi.clustermap.svg", **config.figkws)
+
+    # pg = p.T.join(config.roi_attributes[['disease_subgroup', 'sample']]).groupby('disease_subgroup').mean().T
+    # grid = clustermap(pg.corr(), cmap='coolwarm', vmin=-1, vmax=1)
+    # grid.savefig(output_dir / "positivity.similarity.disease_subgroup.clustermap.svg", **config.figkws)
+
+    # # Illustrations
+    # p = perc.loc[:, 'Alveolar type 2', :]['SARSSpikeS1(Eu153)']
+    # c = config.roi_attributes.join(p).query("disease_subgroup == 'COVID-19-long-pos'").sort_values("SARSSpikeS1(Eu153)")
+    # 'A20_137_A26'
+    # roi_name = c.index[-2]
+    # roi_name = 'A21_63_A14-05'
+    # roi = [r for r in prj.rois if r.name == roi_name][0]
+    # fig = roi.plot_channels(['aSMA', 'AQ1', 'Ki67', 'Periostin', 'ColTypeI'], equalize=False, minmax=False, log=True, merged=True, smooth=0.5)
+    # fig.savefig(config.results_dir / 'illustration' / roi.name + ".markers.merged.svg", **config.figkws)
+
+    # fig = roi.plot_channels(['ColTypeI', 'CD31', 'K818'], equalize=True, merged=False)
+    # fig = roi.plot_channels(['ColTypeI', 'CD31', 'K818'], equalize=True, merged=True)
+    # fig = roi.plot_channels(['CD68', 'IL6', 'IRF'], equalize=True, merged=True)
+    # fig = roi.plot_channels(['CD68', 'IL6', 'IRF'], equalize=True, merged=False)
+    # # fig.savefig(config.results_dir / 'illustration' / roi.name + ".markers.svg", **config.figkws)
+
+    # roi_name = 'A21_67_A30-04'
+    # pos = [(360, 270), (450, 350)]
+
+    # fig = roi.plot_channels(['SARS', 'aSMA', 'CD45', 'SFTPC', 'SFTPA', 'K818', 'IL6', 'MPO', 'CD206', 'AQ1', 'CC3', 'Col', 'CD31'], equalize=True, position=pos)
+    # # fig.savefig(config.results_dir / 'illustration' / roi.name + ".markers.svg", **config.figkws)
+
+    # fig = roi.plot_channels(['DNA1', 'SARS', 'SFTPC'], position=pos, equalize=False, minmax=False, log=False, smooth=0)
+    # fig.savefig(config.results_dir / 'illustration' / roi.name + ".markers.zoom.separate.svg", **config.figkws)
+
+    # fig = roi.plot_channels(['DNA1', 'SARS', 'SFTPC'], position=pos, equalize=False, minmax=False, log=False, merged=True, smooth=0)
+    # fig.savefig(config.results_dir / 'illustration' / roi.name + ".markers.zoom.merged.svg", **config.figkws)
+
+    # pal = sns.color_palette('tab10')
+    # target = [pal[3], pal[2], pal[0]]
+    # for ch, color in zip(['SARS', 'SFTPC', 'K818'], target):
+    #     fig = roi.plot_channels([ch], position=pos, equalize=False, minmax=False, log=False, merged=True, smooth=1)
+    #     fig.savefig(config.results_dir / 'illustration' / roi.name + f".markers.zoom.{ch}.svg", **config.figkws)
+
+    # fig, axes = plt.subplots(2, 2)
+    # pal = sns.color_palette('tab10')
+    # target = [pal[3], pal[2], pal[0]]
+    # roi.plot_channels(['SARS', 'SFTPC', 'DNA1',], position=pos, equalize=False, minmax=False, log=False, merged=True, smooth=0, target_colors=target, axes=[fig.axes[0]])
+    # for ax, ch, color in zip(fig.axes[1:], ['SARS', 'SFTPC', 'DNA1',], target):
+    #     colors = [(0,0,0), color]
+    #     newcmp = matplotlib.colors.LinearSegmentedColormap.from_list('', colors)
+    #     # newcmp = matplotlib.colors.LinearSegmentedColormap('testCmap', segmentdata=cdict, N=256)
+    #     roi.plot_channel(ch, position=pos, equalize=False, minmax=False, log=False, smooth=1, ax=ax, cmap=newcmp)
+    # fig.savefig(config.results_dir / 'illustration' / roi.name + f".markers.zoom.separate.svg", **config.figkws)
+
+    # fig = roi.plot_channels(['SARS', 'SFTPC', 'K818'], merged=True, target_colors=target, equalize=False, log=False, minmax=False)  # target_colors=['red', 'green', 'blue']
+    # fig.savefig(config.results_dir / 'illustration' / roi.name + ".markers.merged.svg", **config.figkws)
+
+    # for ch, color in zip(['SARS', 'SFTPC', 'K818'], target):
+    #     fig = roi.plot_channels([ch], merged=True, target_colors=[color], equalize=False, log=False, minmax=False)  # target_colors=['red', 'green', 'blue']
+    #     fig.savefig(config.results_dir / 'illustration' / roi.name + f".markers.{ch}.svg", **config.figkws)
+
+    for group in ["disease", "disease_subgroup"]:
+        for df2, label in [(mm2, "mm2"), (perc, "perc")]:
+            p = (
+                df2.join(config.roi_attributes[group])
+                .reset_index()
+                .groupby([group, "cell_type_label_3.5"])
+                .mean()
+                .reset_index()
+            )
+            pp = p.pivot_table(index="cell_type_label_3.5", columns=group)
+            grid = clustermap(
+                pp,
+                cbar_kws=dict(label=label),
+                col_cluster=False,
+                square=True,
+                config="abs",
+            )
+            grid.savefig(
+                output_dir
+                / f"all_markers_positivity.by_{group}.{label}.clustermap.abs.svg",
+                **config.figkws,
+            )
             plt.close(grid.fig)
 
-            grid = clustermap(pp + np.random.random(pp.shape) * 1e-10, cbar_kws=dict(label=label), col_cluster=False, square=True, config='z')
-            grid.savefig(output_dir / f"all_markers_positivity.by_{group}.{label}.clustermap.z.svg", **config.figkws)
+            grid = clustermap(
+                pp + np.random.random(pp.shape) * 1e-10,
+                cbar_kws=dict(label=label),
+                col_cluster=False,
+                square=True,
+                config="z",
+            )
+            grid.savefig(
+                output_dir
+                / f"all_markers_positivity.by_{group}.{label}.clustermap.z.svg",
+                **config.figkws,
+            )
             plt.close(grid.fig)
 
             ppp = pp.copy()
@@ -1304,58 +2494,156 @@ def marker_positivity(a: AnnData) -> AnnData:
                 ppp[col] = (ppp[col] - ppp[col].values.mean()) / ppp[col].values.std()
 
             ppp += np.random.random(ppp.shape) * 1e-10
-            grid = clustermap(ppp.fillna(0), cbar_kws=dict(label=label), col_cluster=False, square=True, config='abs', vmin=0, vmax=5)
-            grid.savefig(output_dir / f"all_markers_positivity.by_{group}.{label}.clustermap.std.svg", **config.figkws)
+            grid = clustermap(
+                ppp.fillna(0),
+                cbar_kws=dict(label=label),
+                col_cluster=False,
+                square=True,
+                config="abs",
+                vmin=0,
+                vmax=5,
+            )
+            grid.savefig(
+                output_dir
+                / f"all_markers_positivity.by_{group}.{label}.clustermap.std.svg",
+                **config.figkws,
+            )
             plt.close(grid.fig)
-
 
     # Compare with expression
     df = a[:, config.cell_state_markers].to_df()
-    col = 'SARSSpikeS1(Eu153)'
+    col = "SARSSpikeS1(Eu153)"
     # df.loc[~a.obs['covid'], col] = df.loc[~a.obs['covid'], col] * 0.8
-    mean = df.join(a.obs[['roi', 'cell_type_label_3.5']]).groupby(['roi', 'cell_type_label_3.5']).mean().fillna(0)
+    mean = (
+        df.join(a.obs[["roi", "cell_type_label_3.5"]])
+        .groupby(["roi", "cell_type_label_3.5"])
+        .mean()
+        .fillna(0)
+    )
 
-    label = 'expression'
-    for group in ['disease', 'disease_subgroup']:
-        p = mean.join(config.roi_attributes[group]).reset_index().groupby([group, 'cell_type_label_3.5']).mean().reset_index()
-        pp = p.pivot_table(index='cell_type_label_3.5', columns=group)
+    label = "expression"
+    for group in ["disease", "disease_subgroup"]:
+        p = (
+            mean.join(config.roi_attributes[group])
+            .reset_index()
+            .groupby([group, "cell_type_label_3.5"])
+            .mean()
+            .reset_index()
+        )
+        pp = p.pivot_table(index="cell_type_label_3.5", columns=group)
 
         pp = ((pp.T - pp.mean(1))).T
 
-        grid = clustermap(pp, cbar_kws=dict(label=label), col_cluster=False, square=True, config='abs', vmin=0)
-        grid.savefig(output_dir / f"all_markers_positivity.by_{group}.{label}.clustermap.abs.svg", **config.figkws)
+        grid = clustermap(
+            pp,
+            cbar_kws=dict(label=label),
+            col_cluster=False,
+            square=True,
+            config="abs",
+            vmin=0,
+        )
+        grid.savefig(
+            output_dir
+            / f"all_markers_positivity.by_{group}.{label}.clustermap.abs.svg",
+            **config.figkws,
+        )
         plt.close(grid.fig)
 
-        grid = clustermap(pp + np.random.random(pp.shape) * 1e-10, cbar_kws=dict(label=label), col_cluster=False, square=True, config='z', vmin=-1, vmax=5)
-        grid.savefig(output_dir / f"all_markers_positivity.by_{group}.{label}.clustermap.z.svg", **config.figkws)
+        grid = clustermap(
+            pp + np.random.random(pp.shape) * 1e-10,
+            cbar_kws=dict(label=label),
+            col_cluster=False,
+            square=True,
+            config="z",
+            vmin=-1,
+            vmax=5,
+        )
+        grid.savefig(
+            output_dir / f"all_markers_positivity.by_{group}.{label}.clustermap.z.svg",
+            **config.figkws,
+        )
         plt.close(grid.fig)
 
 
-def periostin_interactions(a: AnnData) -> AnnData:
+def cith3_ammount() -> AnnData:
+    # Check extent of periostin
+    from src.pathology import quantify_fibrosis
+
+    col = "CitH3(Sm154)"
+    res = quantify_fibrosis(col)
+    res.to_csv(config.results_dir / "pathology" / f"{col}_score.csv")
+
+    fig, stats = swarmboxenplot(
+        data=res.join(config.roi_attributes), x="disease", y=res.columns
+    )
+    fig.savefig(
+        config.results_dir / "pathology" / f"{col}_score.disease.svg", **config.figkws
+    )
+    fig, stats = swarmboxenplot(
+        data=res.join(config.roi_attributes), x="disease_subgroup", y=res.columns
+    )
+    fig.savefig(
+        config.results_dir / "pathology" / f"{col}_score.disease_subgroup.svg",
+        **config.figkws,
+    )
+
+    res2 = res.loc[res.sort_values("score").index[:-1]]
+
+    fig, stats = swarmboxenplot(
+        data=res2.join(config.roi_attributes), x="disease", y=res2.columns
+    )
+    fig.savefig(
+        config.results_dir / "pathology" / f"{col}_score.disease.no_out.svg",
+        **config.figkws,
+    )
+    fig, stats = swarmboxenplot(
+        data=res2.join(config.roi_attributes), x="disease_subgroup", y=res2.columns
+    )
+    fig.savefig(
+        config.results_dir / "pathology" / f"{col}_score.disease_subgroup.no_out.svg",
+        **config.figkws,
+    )
+
+
+def periostin_interactions() -> AnnData:
     a = sc.read(config.results_dir / "phenotyping" / "processed.labeled.h5ad")
-    a.obs['covid'] = a.obs['disease'].isin(['COVID-19', 'Mixed', 'Convalescent'])
+    a.obs["covid"] = a.obs["disease"].isin(["COVID-19", "Mixed", "Convalescent"])
 
     # Check extent of periostin
     from src.pathology import quantify_fibrosis
 
     df = a.raw.to_adata().to_df()
-    col = 'Periostin(Dy161)'
+    col = "Periostin(Dy161)"
 
     fib = quantify_fibrosis(col)
-    fib.to_csv(config.results_dir / 'pathology' / f'{col}_score.csv')
-    fig, stats = swarmboxenplot(data=fib.join(config.roi_attributes), x='disease', y=fib.columns)
-    fig.savefig(config.results_dir / 'pathology' / f'{col}_score.disease.svg', **config.figkws)
-    fig, stats = swarmboxenplot(data=fib.join(config.roi_attributes), x='disease_subgroup', y=fib.columns)
-    fig.savefig(config.results_dir / 'pathology' / f'{col}_score.disease_subgroup.svg', **config.figkws)
+    fib.to_csv(config.results_dir / "pathology" / f"{col}_score.csv")
+    fig, stats = swarmboxenplot(
+        data=fib.join(config.roi_attributes), x="disease", y=fib.columns
+    )
+    fig.savefig(
+        config.results_dir / "pathology" / f"{col}_score.disease.svg", **config.figkws
+    )
+    fig, stats = swarmboxenplot(
+        data=fib.join(config.roi_attributes), x="disease_subgroup", y=fib.columns
+    )
+    fig.savefig(
+        config.results_dir / "pathology" / f"{col}_score.disease_subgroup.svg",
+        **config.figkws,
+    )
 
     # Quantify cell type distance to periostin
     from imc.ops.quant import quantify_cell_intensity
+
     _dists = list()
     for roi in tqdm(prj.rois):
         x = np.log1p(roi._get_channel(marker)[1].squeeze())
         mask = skimage.filters.gaussian(x, 2) > skimage.filters.threshold_otsu(x)
-        dist = scipy.ndimage.morphology.distance_transform_edt((~mask).astype(int), sampling=[2, 2])
-        q = quantify_cell_intensity(dist[np.newaxis, ...], roi.mask).rename(columns={0: 'distance'})
+        dist = scipy.ndimage.morphology.distance_transform_edt(
+            (~mask).astype(int), sampling=[2, 2]
+        )
+        q = quantify_cell_intensity(dist[np.newaxis, ...], roi.mask).rename(
+            columns={0: "distance"}
+        )
         _dists.append(q.assign(sample=roi.sample.name, roi=roi.name))
 
         # fig, axes = plt.subplots(1, 3)
@@ -1367,51 +2655,251 @@ def periostin_interactions(a: AnnData) -> AnnData:
     index = dists.index
     dists = dists.merge(config.roi_areas.reset_index())
     dists.index = index
-    dists['distance_norm'] = (dists['distance'] / dists['area_mm2']) * 1e6
-    dists.to_csv(output_dir / f'{col}_cell_distance.csv')
+    dists["distance_norm"] = (dists["distance"] / dists["area_mm2"]) * 1e6
+    dists.to_csv(output_dir / f"{col}_cell_distance.csv")
 
     # plt.scatter(dists['distance'], dists['distance_norm'], alpha=0.1, s=2)
 
-    a.obs[f'distance_to_{col}'] = dists['distance'].values
-    a.obs[f'distance_to_{col}_norm'] = dists['distance_norm'].values
-    diff_dists = a.obs.groupby(['disease', 'cell_type_label_3.5'])[f'distance_to_{col}_norm'].mean()
+    a.obs[f"distance_to_{col}"] = dists["distance"].values
+    a.obs[f"distance_to_{col}_norm"] = dists["distance_norm"].values
+    diff_dists = a.obs.groupby(["disease", "cell_type_label_3.5"])[
+        f"distance_to_{col}_norm"
+    ].mean()
 
-    (diff_dists['COVID-19'] - diff_dists['Normal']).sort_values()
-    (diff_dists['Convalescent'] - diff_dists['Normal']).sort_values()
-    (diff_dists['UIP/IPF'] - diff_dists['Normal']).sort_values()
+    (diff_dists["COVID-19"] - diff_dists["Normal"]).sort_values()
+    (diff_dists["Convalescent"] - diff_dists["Normal"]).sort_values()
+    (diff_dists["UIP/IPF"] - diff_dists["Normal"]).sort_values()
 
-    dists_p = diff_dists.to_frame().pivot_table(index='cell_type_label_3.5', columns='disease', values=f'distance_to_{col}')
-    grid = clustermap(dists_p, cmap='RdBu_r', center=0)
-    grid.savefig(output_dir / f'{col}_cell_distance.aggregated_cell_type.heatmap.svg', **config.figkws)
-    grid = clustermap((dists_p.T - dists_p['Normal']).T.drop(['Normal'], axis=1), cmap='RdBu_r', center=0)
-    grid.savefig(output_dir / f'{col}_cell_distance.aggregated_cell_type.relative_normal.heatmap.svg', **config.figkws)
+    dists_p = diff_dists.to_frame().pivot_table(
+        index="cell_type_label_3.5", columns="disease", values=f"distance_to_{col}"
+    )
+    grid = clustermap(dists_p, cmap="RdBu_r", center=0)
+    grid.savefig(
+        output_dir / f"{col}_cell_distance.aggregated_cell_type.heatmap.svg",
+        **config.figkws,
+    )
+    grid = clustermap(
+        (dists_p.T - dists_p["Normal"]).T.drop(["Normal"], axis=1),
+        cmap="RdBu_r",
+        center=0,
+    )
+    grid.savefig(
+        output_dir
+        / f"{col}_cell_distance.aggregated_cell_type.relative_normal.heatmap.svg",
+        **config.figkws,
+    )
 
     # Now account for cell type composition of ROIs
-    c = a.obs[['roi', 'disease_subgroup', 'cell_type_label_3.5', f'distance_to_{col}']].copy()
+    c = a.obs[
+        ["roi", "disease_subgroup", "cell_type_label_3.5", f"distance_to_{col}"]
+    ].copy()
     _res = list()
     for n in tqdm(range(100)):
         d = c.copy()
-        for roi in c['roi'].unique():
-            d.loc[d['roi'] == roi, 'cell_type_label_3.5'] = d.loc[d['roi'] == roi, 'cell_type_label_3.5'].sample(frac=1).values
-        e = d.groupby(['disease_subgroup', 'cell_type_label_3.5'])[f'distance_to_{col}'].mean()
+        for roi in c["roi"].unique():
+            d.loc[d["roi"] == roi, "cell_type_label_3.5"] = (
+                d.loc[d["roi"] == roi, "cell_type_label_3.5"].sample(frac=1).values
+            )
+        e = d.groupby(["disease_subgroup", "cell_type_label_3.5"])[
+            f"distance_to_{col}"
+        ].mean()
         _res.append(e)
 
     random_dists = pd.concat(_res).groupby(level=[0, 1]).mean()
-    obs_dists = a.obs.groupby(['disease_subgroup', 'cell_type_label_3.5'])[f'distance_to_{col}'].mean()
+    obs_dists = a.obs.groupby(["disease_subgroup", "cell_type_label_3.5"])[
+        f"distance_to_{col}"
+    ].mean()
     norm_dists = np.log(obs_dists / random_dists).rename(f"distance_to_{col}")
 
-    norm_dists_agg = norm_dists.to_frame().pivot_table(index='cell_type_label_3.5', columns='disease_subgroup', values=f'distance_to_{col}')
+    norm_dists_agg = norm_dists.to_frame().pivot_table(
+        index="cell_type_label_3.5",
+        columns="disease_subgroup",
+        values=f"distance_to_{col}",
+    )
 
-    dist_diff = (norm_dists_agg.T - norm_dists_agg['Normal']).T.drop(['Normal'], axis=1)
+    dist_diff = (norm_dists_agg.T - norm_dists_agg["Normal"]).T.drop(["Normal"], axis=1)
     order = dist_diff.mean(1).sort_values().index
 
-    grid = clustermap(norm_dists_agg.loc[order, :], figsize=(4, 5), center=0, row_cluster=False, col_cluster=False, cmap='PuOr_r', cbar_kws=dict(label="Relative distance to Periostin patch\nlog(observed / expected)"))
-    grid.savefig(output_dir / f'{col}_cell_distance.aggregated_cell_type.norm.heatmap.svg', **config.figkws)
+    grid = clustermap(
+        norm_dists_agg.loc[order, :],
+        figsize=(4, 5),
+        center=0,
+        row_cluster=False,
+        col_cluster=False,
+        cmap="PuOr_r",
+        cbar_kws=dict(
+            label="Relative distance to Periostin patch\nlog(observed / expected)"
+        ),
+    )
+    grid.savefig(
+        output_dir / f"{col}_cell_distance.aggregated_cell_type.norm.heatmap.svg",
+        **config.figkws,
+    )
 
-    grid = clustermap(dist_diff.loc[order, :], figsize=(4, 5), cmap='RdBu_r', center=0, row_cluster=False, col_cluster=False, cbar_kws=dict(label="Difference to 'Normal'\nin distance to Periostin patch"))
-    grid.savefig(output_dir / f'{col}_cell_distance.aggregated_cell_type.norm.relative_normal.heatmap.svg', **config.figkws)
+    grid = clustermap(
+        dist_diff.loc[order, :],
+        figsize=(4, 5),
+        cmap="RdBu_r",
+        center=0,
+        row_cluster=False,
+        col_cluster=False,
+        cbar_kws=dict(label="Difference to 'Normal'\nin distance to Periostin patch"),
+    )
+    grid.savefig(
+        output_dir
+        / f"{col}_cell_distance.aggregated_cell_type.norm.relative_normal.heatmap.svg",
+        **config.figkws,
+    )
 
 
+def increased_diversity(
+    prefix: str, cois: list[str], resolution: float, assemble_figure: bool = True
+) -> AnnData:
+    a = sc.read(config.results_dir / "phenotyping" / "processed.labeled.h5ad")
+    a.obs["covid"] = a.obs["disease"].isin(["COVID-19", "Mixed", "Convalescent"])
+
+    output_dir = config.results_dir / "phenotyping"
+    cell_type_label = "cell_type_label_3.5"
+    cluster = f"{prefix}_{resolution}"
+    label = f"{prefix}_diversity.leiden_{str(resolution).replace('.', '')}"
+
+    a = a[a.obs[cell_type_label].isin(cois), :]
+
+    fig = sc.pl.umap(a, color=[cell_type_label, "cluster_3.5"], show=False, ncols=1)[
+        0
+    ].figure
+    fig.suptitle(f"Original UMAP, {int(a.shape[0])} cells")
+    rasterize_scanpy(fig)
+    fig.savefig(output_dir / f"{label}.1-umap_1_original.svg", **config.figkws)
+
+    new_h5ad_f = output_dir / f"{label}.h5ad"
+    if not new_h5ad_f.exists():
+        sc.tl.umap(a)
+        sc.tl.leiden(a, resolution=resolution, key_added=cluster)
+        a.obs[cluster] = f"{prefix}_cluster_" + (a.obs[cluster].astype(int) + 1).astype(
+            str
+        )
+        a.write(new_h5ad_f)
+    a = sc.read(new_h5ad_f)
+
+    fig = sc.pl.umap(a, color=[cell_type_label, cluster], show=False, ncols=1)[0].figure
+    fig.suptitle(f"New UMAP, {int(a.shape[0])} cells")
+    rasterize_scanpy(fig)
+    fig.savefig(output_dir / f"{label}.1-umap_2_new.svg", **config.figkws)
+
+    cats = a.obs[cluster].cat.categories[a.obs[cluster].value_counts() >= 100]
+    a = a[a.obs[cluster].isin(cats), :]
+
+    cmean = (
+        a.to_df()[[x for x in config.channels_include if x in a.var.index]]
+        .groupby(a.obs[cluster])
+        .mean()
+    )
+
+    origc = a.obs[cluster].groupby(a.obs[cell_type_label]).value_counts()
+    s = a.obs[cluster].groupby(a.obs[cell_type_label]).size()
+    origc = (origc / s) * 100
+    cts = origc.reset_index().pivot_table(
+        index="level_1", columns=cell_type_label, values=cluster
+    )
+    cts = (cts.T / cts.sum(1)).T
+
+    top = a.obs[cluster].groupby(a.obs["topological_domain"]).value_counts()
+    s = a.obs[cluster].groupby(a.obs["topological_domain"]).size()
+    top = (top / s) * 100
+    top = top.reset_index().pivot_table(
+        index="level_1", columns="topological_domain", values=cluster
+    )
+    top = (top.T / top.sum(1)).T
+    top.columns = top.columns.to_series().replace(config.topo_labels)
+    top = top[config.topo_labels.values()]
+
+    cov = a.obs[cluster].groupby(a.obs["covid"]).value_counts()
+    s = a.obs[cluster].groupby(a.obs["covid"]).size()
+    cov = (cov / s) * 100
+    cov = cov.reset_index().pivot_table(
+        index="level_1", columns="covid", values=cluster
+    )
+    cov = np.log(cov[True] / cov[False]).rename("log(COVID / non-COVID)")
+
+    abu = np.log10(a.obs[cluster].value_counts().to_frame("abundance"))
+
+    grid = clustermap(
+        cmean,
+        cmap="RdBu_r",
+        center=0,
+        row_colors=abu.join(cts).join(cov),
+        config="abs",
+        cbar_kws=dict(label="Marker intensity"),
+        metric="euclidean",
+    )
+    # grid.ax_heatmap.set_yticklabels(grid.ax_heatmap.get_yticklabels(), rotation=90)
+    grid.savefig(output_dir / f"{label}.2-clustermap.svg", **config.figkws)
+    grid2 = clustermap(
+        top,
+        row_linkage=grid.dendrogram_row.linkage,
+        col_cluster=False,
+        config="abs",
+        cbar_kws=dict(label="Fraction in compartment"),
+        figsize=(2, 4),
+        cmap="inferno",
+        square=True,
+    )
+    # grid2.ax_heatmap.set_yticklabels(grid2.ax_heatmap.get_yticklabels(), rotation=90)
+    grid2.savefig(
+        output_dir / f"{label}.3-clustermap.topo_domains.svg",
+        **config.figkws,
+    )
+
+    cov = cov.iloc[grid.dendrogram_row.reordered_ind[::-1]]
+
+    fig, ax = plt.subplots(figsize=(2, 8))
+    ax.scatter(cov, cov.index)
+    ax.axvline(0, linestyle="--", color="grey")
+    ax.set(xlabel="log(COVID / non-COVID)", title="Ordered as heatmap")
+    fig.savefig(
+        output_dir / f"{label}.4-log_foldchange.ordered.svg",
+        **config.figkws,
+    )
+
+    cov = cov.sort_values()
+    fig, ax = plt.subplots(figsize=(2, 8))
+    ax.scatter(cov, cov.index)
+    ax.axvline(0, linestyle="--", color="grey")
+    ax.set(xlabel="log(COVID / non-COVID)", title="Sorted")
+    fig.savefig(
+        output_dir / f"{label}.5-log_foldchange.sorted.svg",
+        **config.figkws,
+    )
+
+    counts = (
+        a.obs.groupby("roi")[cluster]
+        .value_counts()
+        .reset_index()
+        .pivot_table(index="roi", columns="level_1", values=cluster)
+        .rename_axis(columns=cluster)
+    )
+    counts_mm2 = (counts.T / config.roi_areas).T * 1e6
+    fig, stats = swarmboxenplot(
+        data=counts_mm2.join(config.roi_attributes),
+        x="disease_subgroup",
+        y=counts.columns,
+        plot_kws=dict(palette=config.colors["disease_subgroup"]),
+    )
+    fig.savefig(
+        output_dir / f"{label}.6-swarmboxenplot.svg",
+        **config.figkws,
+    )
+
+    # Assemble sharable figure
+    ## Dependencies: inkscape, https://github.com/astraw/svg_stack
+    if assemble_figure:
+        cmd = f"svg_stack.py --direction=h --margin=20 {output_dir}/{label}*.svg > {output_dir}/{label}.all.svg"
+        os.system(cmd)
+        cmd = f"inkscape --export-background=white -d 300 -o {output_dir}/{label}.all.png {output_dir}/{label}.all.svg"
+        os.system(cmd)
+        cmd = f"inkscape --export-background=white -d 300 -o {output_dir}/{label}.all.pdf {output_dir}/{label}.all.svg"
+        os.system(cmd)
 
 
 def cellular_interactions():
@@ -1462,7 +2950,7 @@ def cellular_interactions():
         )
         plt.close(fig)
 
-        # # Plot as differnece to baseline
+        # # Plot as difference to baseline
         base = config.attribute_order[attr][0]
         base_adj = adjs.query(f"{attr} == '{base}'")
         base_adj = (
@@ -1521,6 +3009,8 @@ def cellular_interactions():
         )
         stats.to_csv(output_dir / f"cellular_interactions.per_{attr}.csv", index=False)
 
+        stats = pd.read_csv(output_dir / f"cellular_interactions.per_{attr}.csv")
+
         # # Volcano plots
         base = config.attribute_order[attr][0]
 
@@ -1529,7 +3019,7 @@ def cellular_interactions():
             stats=res,
             n_top=15,
             diff_threshold=None,
-            fig_kws=dict(gridspec_kw=dict(wspace=3, hspace=1)),
+            fig_kws=dict(gridspec_kw=dict(wspace=3, hspace=1), figsize=(18, 9)),
         )
         fig.savefig(
             output_dir / f"cellular_interactions.per_{attr}.volcano_plot.svg",
@@ -1537,34 +3027,228 @@ def cellular_interactions():
         )
         plt.close(fig)
 
+        if attr == "disease":
+            res = stats.query(f"`A` == 'COVID-19' & B == 'Convalescent'")
+            fig = volcano_plot(
+                stats=res,
+                n_top=15,
+                diff_threshold=None,
+                fig_kws=dict(gridspec_kw=dict(wspace=3, hspace=1)),
+            )
+            fig.savefig(
+                output_dir
+                / f"cellular_interactions.per_{attr}.PASC-COVID.volcano_plot.svg",
+                **config.figkws,
+            )
+            plt.close(fig)
+
+        if attr == "disease_subgroup":
+            res = stats.query(f"`A` == 'COVID-19-long-pos' & B == 'COVID-19-long-neg'")
+            fig = volcano_plot(
+                stats=res,
+                n_top=15,
+                diff_threshold=None,
+                fig_kws=dict(gridspec_kw=dict(wspace=3, hspace=1)),
+            )
+            fig.savefig(
+                output_dir
+                / f"cellular_interactions.per_{attr}.PASC-neg-pos.volcano_plot.svg",
+                **config.figkws,
+            )
+            plt.close(fig)
+
+    # Examples
+    ct1 = "Airway wall vascular endothelial"
+    ct2 = "Alveolar type 2"
+    a = adjs.query(f"disease == 'COVID-19' & index == '{ct1}' & variable == '{ct2}'")
+    b = adjs.query(
+        f"disease == 'Convalescent' & index == '{ct1}' & variable == '{ct2}'"
+    )
+
+    a.groupby("sample")["value"].mean()
+    b.groupby("sample")["value"].mean()
+
+    roi_name = b.sort_values("value").iloc[-1]["roi"]
+    r = [r for r in prj.rois if r.name == roi_name][0]
+    c = r.clusters.drop_duplicates().reset_index(drop=True)
+    c.index += 1
+    to_rep = {v: str(k).zfill(2) + " - " + v for k, v in c.items()}
+
+    fig = plot_cell_types(r, cell_type_assignments=r.clusters.replace(to_rep))
+    fig = r.plot_cell_type(ct1)
+    fig = r.plot_cell_type(ct2)
+
+    roi_name = "A21_63_A14-05"
+    r = [r for r in prj.rois if r.name == roi_name][0]
+
+    target_colors = sns.color_palette("tab10")
+    rgb = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
+    fig = r.plot_channels(
+        ["CD31", "AQ1", "aSMA"],
+        merged=True,
+        smooth=0.5,
+        log=False,
+        minmax=True,
+        equalize=True,
+        target_colors=rgb,
+    )  # , target_colors=target_colors[:3])
+    fig = r.plot_channels(
+        ["K818", "SFTPC", "SFTPA"],
+        merged=True,
+        smooth=0.5,
+        log=False,
+        minmax=True,
+        equalize=True,
+        target_colors=rgb,
+    )  # , target_colors=target_colors[3:6])
+    fig = r.plot_channels(
+        ["ColTypeI", "Periostin", "Vimentin"],
+        merged=True,
+        smooth=0.5,
+        log=False,
+        minmax=True,
+        equalize=True,
+        target_colors=rgb,
+    )  # , target_colors=target_colors[6:9])
+    fig = r.plot_channels(
+        ["IL6", "pNFkbp65", "pSTAT3Tyr705"],
+        merged=True,
+        smooth=0.5,
+        log=False,
+        minmax=True,
+        equalize=True,
+        target_colors=rgb,
+    )  # , target_colors=target_colors[6:9])
+
+    fig = r.plot_channels(
+        r.channel_include, smooth=0.5, log=False, minmax=True, equalize=True
+    )
+    fig.savefig(
+        output_dir / roi_name + ".all_channels.illustration.pdf", **config.figkws
+    )
+
+    #
+
+    #
 
     # Dimres based on interactions
     f = prj.results_dir / "single_cell" / prj.name + ".adjacency_frequencies.csv"
     adjs = pd.read_csv(f, index_col=0)
+    adjs = adjs.loc[adjs["index"] != adjs["variable"]]
 
-    adjs['interaction'] = adjs['index'] + " - " + adjs['variable']
+    # adjs["interaction2"] = adjs["variable"] + " <-> " + adjs["index"]
+    # adjs = adjs.loc[adjs['interaction'] != adjs['interaction2']]
 
-    piv = adjs.pivot_table(index='roi', columns='interaction', values='value')
+    for i, row in tqdm(adjs.iterrows(), total=adjs.shape[0]):
+        adjs.loc[i, "comb"] = "-".join(sorted([row["index"], row["variable"]]))
+    adjs = adjs.drop_duplicates(subset=["comb", "value"])
+    adjs["interaction"] = adjs["index"] + " <-> " + adjs["variable"]
 
-    grid = clustermap(piv, config='z')
-    grid = clustermap(piv, config='abs', center=0, cmap='RdBu_r', robust=False)
+    piv = adjs.pivot_table(index="roi", columns="interaction", values="value")
+    piv = piv.loc[:, ~piv.isnull().any()]
 
-    ai = AnnData(6 ** piv.values, obs=config.roi_attributes, var=piv.columns.to_frame())
+    grid = clustermap(piv, config="z", row_colors=config.roi_attributes)
+    grid = clustermap(
+        piv,
+        config="abs",
+        center=0,
+        cmap="RdBu_r",
+        robust=False,
+        row_colors=config.roi_attributes,
+    )
+
+    piv2 = piv.copy()
+    piv2[piv2 < 0] = 0
+    # piv2[piv2 < 2] = 0
+    # piv2[piv2 >= 2] = 1
+    piv2 = piv2.loc[:, piv2.var() > 0]
+    grid = clustermap(
+        np.log1p(piv2),
+        metric="correlation",
+        row_colors=config.roi_attributes,
+        figsize=(6, 6),
+        dendrogram_ratio=0.1,
+        xticklabels=False,
+    )
+    grid.ax_heatmap.set(rasterized=True)
+    grid.fig.savefig(
+        output_dir / f"cellular_interactions.all_rois.clustermap.svg",
+        **config.figkws,
+    )
+    plt.close(grid.fig)
+
+    ai = AnnData(piv2.values, obs=config.roi_attributes, var=piv2.columns.to_frame())
+    ai = ai[~ai.obs["disease"].isin(["Mixed"]), :]
+    # ai = ai[ai.obs['disease'].isin(['Normal', 'UIP/IPF']), :]
+    # res = stats.query(f"`A` == 'Normal' & B == 'UIP/IPF'").sort_values('hedges').set_index("Variable")
+    # sel = res.head(10).index.tolist() + res.tail(10).index.tolist()
+    # ai = ai[:, ai.var.index.isin(sel)]
     sc.pp.log1p(ai)
     sc.pp.highly_variable_genes(ai)
-    sc.pl.highly_variable_genes(ai)
-    sc.pp.scale(ai)
+    fig = sc.pl.highly_variable_genes(ai, show=False).figure
+    fig.savefig(
+        output_dir / f"cellular_interactions.highly_variable.svg", **config.figkws
+    )
+    plt.close(fig)
+
+    # sc.pp.scale(ai)
     sc.pp.pca(ai)
 
+    ai.uns["pca"]["variance_ratio"]
+
     sc.pp.neighbors(ai)
-    sc.tl.umap(ai, gamma=10)
+    sc.tl.umap(ai, gamma=3)
     sc.tl.diffmap(ai)
 
     _ai = ai[ai.obs.sample(frac=1).index, :]
-    sc.pl.pca(_ai, color=config.attributes)
-    sc.pl.umap(_ai, color=config.attributes)
-    sc.pl.diffmap(_ai, color=config.attributes)
+    fig = sc.pl.pca(
+        _ai,
+        alpha=0.8,
+        color=config.attributes,
+        components=["1,2", "1,3", "2,3", "2,6"],
+        ncols=4,
+        show=False,
+    )[0].figure
+    rasterize_scanpy(fig)
+    fig.savefig(output_dir / f"cellular_interactions.pca.svg", **config.figkws)
+    plt.close(fig)
+    fig = sc.pl.umap(_ai, alpha=0.8, color=config.attributes, show=False)[0].figure
+    rasterize_scanpy(fig)
+    fig.savefig(output_dir / f"cellular_interactions.umap.svg", **config.figkws)
+    plt.close(fig)
+    fig = sc.pl.diffmap(_ai, alpha=0.8, color=config.attributes, show=False)[0].figure
+    rasterize_scanpy(fig)
+    fig.savefig(output_dir / f"cellular_interactions.diffmap.svg", **config.figkws)
+    plt.close(fig)
 
+    pca = pd.DataFrame(ai.obsm["X_pca"], index=ai.obs.index)
+    pcag = pca.groupby(ai.obs["disease_subgroup"]).mean()
+
+    (pcag.iloc[-1] - pcag.iloc[-2]).sort_values()
+
+    pcs = pd.DataFrame(ai.varm["PCs"], index=ai.var.index)
+    pcs.sort_values(2)
+    pcs.sort_values(3)
+
+    d = (
+        adjs.query(
+            "index == 'CD16+ inflammatory monocytes' & variable == 'Airway wall vascular endothelial'"
+        )
+        .drop(["index", "variable", "interaction", "comb", "sample"], axis=1)
+        .set_index("roi")
+    )
+    fig, stats = swarmboxenplot(
+        data=d.join(config.roi_attributes), x="disease_subgroup", y="value"
+    )
+
+    d = (
+        adjs.query("index == 'Vascular endothelial' & variable == 'Macrophages'")
+        .drop(["index", "variable", "interaction", "comb", "sample"], axis=1)
+        .set_index("roi")
+    )
+    fig, stats = swarmboxenplot(
+        data=d.join(config.roi_attributes), x="disease_subgroup", y="value"
+    )
 
 
 def normalize_background(a: AnnData):
@@ -2056,194 +3740,382 @@ def add_microanatomical_context(a: AnnData):
         plt.close(fig)
 
 
-def unsupervised(a: AnnData):
-    output_dir = (config.results_dir / "unsupervised").mkdir()
-    resolution = 3.5
+def characterize_microanatomical_context():
+    a = sc.read(config.results_dir / "phenotyping" / "processed.labeled.h5ad")
 
-    from sklearn.decomposition import PCA
-
-    c = a.obs.groupby("roi")[f"cell_type_label_{resolution}"].value_counts()
+    c = (
+        a.obs.groupby("topological_domain")[["cell_type_label_3.5"]]
+        .value_counts()
+        .rename("count")
+    )
     c = c.reset_index().pivot_table(
-        index="roi", columns="level_1", values=f"cell_type_label_{resolution}"
+        index="cell_type_label_3.5", columns="topological_domain", values="count"
+    )
+
+    order = [
+        "L-A",
+        "A",
+        "A-AW",
+        "AW",
+        # "background",
+        "AW-M",
+        "M",
+        "AR-M",
+        "AR",
+        "AR-V",
+        "V",
+    ]
+    fig, axes = plt.subplots(
+        2,
+        5,
+        figsize=(5 * 3, 2 * 3),
+        sharey=True,
+        sharex=True,
+        gridspec_kw=dict(wspace=0, hspace=0),
+    )
+    for ax, top in zip(fig.axes, order):
+        sns.barplot(
+            x=c[top] / c[top].sum() * 100,
+            y=c.index,
+            orient="horiz",
+            ax=ax,
+            palette="rainbow",
+        )
+        ax.set(xlabel="", ylabel="")
+        ax.set_title(label=top, loc="center", y=0.85)
+    fig.axes[7].set_xlabel("% cells")
+
+    grid = clustermap(c)
+
+    c = (
+        a.obs.groupby(["roi", "topological_domain"])[["cell_type_label_3.5"]]
+        .value_counts()
+        .rename("count")
+    )
+    cp = (c / c.groupby(level=(0, 1)).sum()).fillna(0) * 100
+
+    q = cp.reset_index().set_index("roi").join(config.roi_attributes)
+
+    m = q.groupby(["disease_subgroup", "topological_domain", "cell_type_label_3.5"])[
+        "count"
+    ].mean()
+    m = m.reset_index().pivot_table(
+        index=["topological_domain", "disease_subgroup"],
+        columns="cell_type_label_3.5",
+        values="count",
+    )
+    grid = clustermap(np.log1p(m), row_cluster=False)
+
+    q["label"] = (
+        q["topological_domain"].astype(str)
+        + " - "
+        + q["cell_type_label_3.5"].astype(str)
+    )
+    for top in order:
+        qq = q.query(f"topological_domain == '{top}'")
+        fig, stats = swarmboxenplot(
+            data=qq, x="cell_type_label_3.5", y="count", hue="disease_subgroup"
+        )
+
+
+def unsupervised(
+    grouping: str = "roi",
+    resolution: float = 3.5,
+    scale: bool = True,
+    regress_out: bool = False,
+    corrmaps: bool = True,
+    add_expression: bool = True,
+    expression_weight: float = 1.0,
+    prefix: str = "",
+):
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import SpectralEmbedding, Isomap, MDS
+
+    output_dir = (config.results_dir / "unsupervised").mkdir()
+    if prefix != "":
+        if not prefix.endswith("."):
+            prefix += "."
+
+    a = sc.read(config.results_dir / "phenotyping" / "processed.labeled.h5ad")
+
+    areas = getattr(config, "roi" + "_areas")
+
+    meta = pd.read_csv(config.metadata_dir / "samples.csv", index_col=0)
+    cols = ["days_since_first_infection", "days_since_positive"]
+    meta = meta[cols]
+
+    c = (
+        a.obs.groupby(["roi"])[[f"cell_type_label_{resolution}"]]
+        .value_counts()
+        .rename("count")
+    )
+    c = c.reset_index().pivot_table(
+        index="roi", columns=f"cell_type_label_{resolution}", values="count"
     )
     cp = (c.T / c.sum(1)).T * 100
-    ca = (c.T / config.roi_areas).T * 1e6
+    ca = (c.T / areas).T * 1e6
 
-    gcp = ca.join(config.roi_attributes).groupby("disease_subgroup").mean().T
+    # stats = pd.concat([ca.mean(), ca.std()], axis=1)
+    # stats.columns = ["mean", "std"]
+    # stats["cv"] = stats["std"] / stats["mean"]
 
-    fig, ax = plt.subplots()
-    sns.heatmap(gcp.drop("Mixed", axis=1).corr(), cmap="RdBu_r", ax=ax)
-    fig.savefig(
-        output_dir / f"corrmap.{cluster}.by_disease_subgroup.heatmap.svg",
-        **config.figkws,
-    )
+    # # fig, axes = plt.subplots(2, 1)
+    # # axes[0].scatter(stats["mean"], stats["std"])
+    # # axes[1].scatter(stats["mean"], stats["cv"])
+    # # for s in stats.index:
+    # #     axes[0].text(stats.loc[s, "mean"], stats.loc[s, "std"], s=s)
+    # #     axes[1].text(stats.loc[s, "mean"], stats.loc[s, "cv"], s=s)
 
-    grid = clustermap(
-        gcp.drop("Mixed", axis=1).corr(),
-        cmap="RdBu_r",
-        rasterized=True,
-    )
-    grid.fig.savefig(
-        output_dir / f"corrmap.{cluster}.by_disease_subgroup.clustermap.svg",
-        **config.figkws,
-    )
+    # sel = stats.loc[stats["cv"] < (1.5 if 'roi' == "roi" else 1)].index
 
-    grid = clustermap(
-        cp.T.corr(),
-        cmap="RdBu_r",
-        center=0,
-        row_colors=config.roi_attributes,
-        rasterized=True,
-    )
-    grid.fig.savefig(
-        output_dir / f"corrmap.{cluster}.per_roi.by_disease_subgroup.clustermap.svg",
-        **config.figkws,
-    )
+    # cp = cp.loc[:, sel]
+    # ca = ca.loc[:, sel]
 
-    cps = cp.join(config.roi_attributes["sample"]).groupby("sample").mean()
-
-    grid = clustermap(
-        cps.T.corr(),
-        cmap="RdBu_r",
-        center=0,
-        row_colors=config.sample_attributes,
-        rasterized=True,
-    )
-    grid.fig.savefig(
-        output_dir / f"corrmap.{cluster}.per_sample.by_disease_subgroup.clustermap.svg",
-        **config.figkws,
-    )
-
-    cp = (cp - cp.mean()) / cp.std()
-    ca = (ca - ca.mean()) / ca.std()
-    for df, label in [(ca, "area"), (cp, "percentage")]:
-        pca = PCA(2)
-        rep = pd.DataFrame(pca.fit_transform(df), index=df.index).join(
-            config.roi_attributes
+    if add_expression:
+        perc = pd.read_csv(
+            config.results_dir
+            / "positivity"
+            / "positivity_per_cell_type.percentage.csv",
+            index_col=0,
+        )
+        mm2 = pd.read_csv(
+            config.results_dir / "positivity" / "positivity_per_cell_type.area.csv",
+            index_col=0,
         )
 
-        fig, ax = plt.subplots(1)
-        for i, g in enumerate(config.attribute_order["disease_subgroup"]):
-            x = rep.loc[rep["disease_subgroup"] == g]
-            color = config.colors["disease_subgroup"][i]
-            ax.scatter(x[0], x[1], color=color, label=g, alpha=0.5)
-            ax.scatter(
-                x[0].mean(),
-                x[1].mean(),
-                marker="^",
-                color=color,
-                s=200,
-                edgecolor="black",
-                linewidth=2,
+        perc = (
+            perc.reset_index()
+            .melt(id_vars=["roi", "cell_type_label_3.5"])
+            .pivot_table(
+                index="roi", columns=["cell_type_label_3.5", "variable"], values="value"
             )
-
-            xp = x.groupby("sample").mean()
-            ax.scatter(
-                xp[0],
-                xp[1],
-                marker=".",
-                color=color,
-                s=100,
-                edgecolor="black",
-                linewidth=2,
+        )
+        perc.columns = perc.columns.map(
+            lambda x: x if isinstance(x, str) else " - ".join(x)
+        )
+        mm2 = (
+            mm2.reset_index()
+            .melt(id_vars=["roi", "cell_type_label_3.5"])
+            .pivot_table(
+                index="roi", columns=["cell_type_label_3.5", "variable"], values="value"
             )
-            for p in xp.index:
-                ax.text(xp.loc[p, 0], xp.loc[p, 1], s=p)
-        ax.set(xlabel="PCA1", ylabel="PCA2")
-        ax.legend()
-        fig.savefig(
-            output_dir / f"pca.{cluster}.{label}.by_disease_subgroup.svg",
-            **config.figkws,
+        )
+        mm2.columns = mm2.columns.map(
+            lambda x: x if isinstance(x, str) else " - ".join(x)
         )
 
-        df = df.join(config.roi_attributes).query("disease != 'Mixed'")[df.columns]
+        cp = cp.join(perc * expression_weight)
+        ca = ca.join(mm2 * expression_weight)
 
-        pca = PCA(2)
-        rep = pd.DataFrame(pca.fit_transform(df), index=df.index).join(
-            config.roi_attributes
+    if scale:
+        cp = (cp - cp.mean()) / cp.std()
+        ca = (ca - ca.mean()) / ca.std()
+
+    if regress_out:
+        ap_perc = pd.read_csv(
+            config.results_dir / "domains" / "domain_distribution.per_roi.perc.csv",
+            index_col=0,
         )
-
-        fig, ax = plt.subplots(1)
-        for i, g in enumerate(config.attribute_order["disease_subgroup"]):
-            x = rep.loc[rep["disease_subgroup"] == g]
-            color = config.colors["disease_subgroup"][i]
-            if x.empty:
-                continue
-            ax.scatter(x[0], x[1], color=color, label=g, alpha=0.5)
-            ax.scatter(
-                x[0].mean(),
-                x[1].mean(),
-                marker="^",
-                color=color,
-                s=200,
-                edgecolor="black",
-                linewidth=2,
-            )
-            ax.scatter(
-                x.groupby("sample")[0].mean(),
-                x.groupby("sample")[1].mean(),
-                marker=".",
-                color=color,
-                s=100,
-                edgecolor="black",
-                linewidth=2,
-            )
-
-            xp = x.groupby("sample").mean()
-            for p in xp.index:
-                ax.text(xp.loc[p, 0], xp.loc[p, 1], s=p)
-        ax.set(xlabel="PCA1", ylabel="PCA2")
-        ax.legend()
-        fig.savefig(
-            output_dir / f"pca.{cluster}.{label}.by_disease_subgroup.no_Mixed.svg",
-            **config.figkws,
+        ap_mm2 = pd.read_csv(
+            config.results_dir / "domains" / "domain_distribution.per_roi.mm2.csv",
+            index_col=0,
         )
+        an = AnnData(cp, obs=ap_perc.reindex(cp.index))
+        sc.pp.scale(an)
+        sc.pp.regress_out(an, ap_perc.columns.tolist(), n_jobs=12)
 
-        df = df.join(config.roi_attributes).query(
-            "disease != 'UIP/IPF' & disease != 'Mixed'"
-        )[df.columns]
+        cp = pd.DataFrame(an.X, index=cp.index, columns=cp.columns)
 
-        pca = PCA(2)
-        rep = pd.DataFrame(pca.fit_transform(df), index=df.index).join(
-            config.roi_attributes
-        )
+        an = AnnData(cp, obs=ap_mm2.reindex(cp.index))
+        sc.pp.scale(an)
+        sc.pp.regress_out(an, ap_mm2.columns.tolist(), n_jobs=12)
 
-        fig, ax = plt.subplots(1)
-        for i, g in enumerate(config.attribute_order["disease_subgroup"]):
-            x = rep.loc[rep["disease_subgroup"] == g]
-            color = config.colors["disease_subgroup"][i]
-            if x.empty:
-                continue
-            ax.scatter(x[0], x[1], color=color, label=g, alpha=0.5)
-            ax.scatter(
-                x[0].mean(),
-                x[1].mean(),
-                marker="^",
-                color=color,
-                s=200,
-                edgecolor="black",
-                linewidth=2,
+        ca = pd.DataFrame(an.X, index=ca.index, columns=ca.columns)
+
+    cf = ca.join(
+        cp.rename(columns=dict(zip(cp.columns, cp.columns.astype(str) + "___")))
+    )
+
+    if grouping == "sample":
+        attrs = getattr(config, "roi_attributes")
+        cp = cp.join(attrs["sample"]).groupby("sample").mean()
+        ca = ca.join(attrs["sample"]).groupby("sample").mean()
+        cf = cf.join(attrs["sample"]).groupby("sample").mean()
+
+    attrs = getattr(config, grouping + "_attributes")
+    attrs = attrs.merge(meta, how="left", left_on="sample", right_index=True)
+
+    gcp = cp.join(attrs["disease_subgroup"]).groupby("disease_subgroup").mean().T
+    gca = ca.join(attrs["disease_subgroup"]).groupby("disease_subgroup").mean().T
+    gcf = cf.join(attrs["disease_subgroup"]).groupby("disease_subgroup").mean().T
+
+    # gcp = gcp.loc[sel, :]
+    # gca = gca.loc[sel, :]
+    # gcf = gcf.loc[sel, :]
+
+    gca = gca.drop("Mixed", axis=1)
+    gcp = gcp.drop("Mixed", axis=1)
+    gcf = gcf.drop("Mixed", axis=1)
+
+    ca = ca.loc[attrs["disease"] != "Mixed"]
+    cp = cp.loc[attrs["disease"] != "Mixed"]
+    cf = cf.loc[attrs["disease"] != "Mixed"]
+
+    if corrmaps:
+        for df1, df2, label in [
+            (cp, gcp, "percentage"),
+            (ca, gca, "area"),
+            (cf, gcf, "combined"),
+        ]:
+            fig, ax = plt.subplots()
+            sns.heatmap(
+                df2.corr(),
+                cmap="coolwarm",
+                vmin=-1,
+                vmax=1,
+                ax=ax,
             )
-            ax.scatter(
-                x.groupby("sample")[0].mean(),
-                x.groupby("sample")[1].mean(),
-                marker=".",
-                color=color,
-                s=100,
-                edgecolor="black",
-                linewidth=2,
+            fig.savefig(
+                output_dir
+                / f"{prefix}corrmap.{resolution}.per_{grouping}.by_disease_subgroup.{label}.heatmap.svg",
+                **config.figkws,
             )
 
-            xp = x.groupby("sample").mean()
-            for p in xp.index:
-                ax.text(xp.loc[p, 0], xp.loc[p, 1], s=p)
-        ax.set(xlabel="PCA1", ylabel="PCA2")
-        ax.legend()
-        fig.savefig(
-            output_dir
-            / f"pca.{cluster}.{label}.by_disease_subgroup.no_IPF_no_Mixed.svg",
-            **config.figkws,
-        )
+            grid = clustermap(
+                df2.corr(),
+                cmap="coolwarm",
+                center=0,
+                dendrogram_ratio=0.1,
+            )
+            grid.fig.savefig(
+                output_dir
+                / f"{prefix}corrmap.{resolution}.per_{grouping}.by_disease_subgroup.{label}.clustermap.svg",
+                **config.figkws,
+            )
+
+            grid = clustermap(
+                df1.T.corr(),
+                cmap="coolwarm",
+                center=0,
+                row_colors=attrs,
+                rasterized=False,
+                dendrogram_ratio=0.1,
+            )
+            grid.ax_heatmap.get_children()[0].set(rasterized=True)
+            grid.fig.savefig(
+                output_dir
+                / f"{prefix}corrmap.{resolution}.per_{grouping}.{label}.clustermap.svg",
+                **config.figkws,
+            )
+
+    for algo, name in [
+        (PCA, "PCA"),
+        (SpectralEmbedding, "SpectralEmbedding"),
+        (Isomap, "Isomap"),
+        (MDS, "MDS"),
+    ]:
+        for df, label in [
+            (cp, "percentage"),
+            (ca, "area"),
+            (cf, "combined"),
+        ]:
+
+            # fig = _plot_lat(
+            #     df,
+            #     algo,
+            #     attributes=["disease_subgroup", "days_since_first_infection"],
+            #     attr_df=attrs,
+            # )
+            # fig.savefig(
+            #     output_dir
+            #     / f"{prefix}{name}.{resolution}.{label}.per_{grouping}.by_disease_subgroup.svg",
+            #     **config.figkws,
+            # )
+
+            df = df.join(attrs).query("disease != 'Mixed'")[df.columns]
+            fig = _plot_lat(
+                df,
+                algo,
+                attributes=["disease_subgroup", "days_since_first_infection"],
+                attr_df=attrs,
+            )
+            fig.savefig(
+                output_dir
+                / f"{prefix}{name}.{resolution}.{label}.per_{grouping}.by_disease_subgroup.no_Mixed.svg",
+                **config.figkws,
+            )
+
+            # df = df.join(attrs).query("disease != 'UIP/IPF' & disease != 'Mixed'")[
+            #     df.columns
+            # ]
+            # fig = _plot_lat(
+            #     df,
+            #     algo,
+            #     attributes=["disease_subgroup", "days_since_first_infection"],
+            #     attr_df=attrs,
+            # )
+            # fig.savefig(
+            #     output_dir
+            #     / f"{prefix}{name}.{resolution}.{label}.per_{grouping}.by_disease_subgroup.no_IPF_no_Mixed.svg",
+            #     **config.figkws,
+            # )
+            plt.close("all")
+
+
+import typing as tp
+from src.types import DataFrame
+
+
+def _plot_lat(
+    df: DataFrame, algo: tp.Callable, attributes: list[str], attr_df: DataFrame
+):
+    from imc.utils import is_numeric
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    model = algo()
+    rep = pd.DataFrame(model.fit_transform(df), index=df.index).join(attr_df)
+
+    n = len(attributes)
+    fig, axes = plt.subplots(1, n, figsize=(4 * n * 1.1, 4), sharex=True, sharey=True)
+    for ax, attr in zip(fig.axes, attributes):
+        if not is_numeric(rep[attr]):
+            for i, g in enumerate(config.attribute_order["disease_subgroup"]):
+                x = rep.loc[rep["disease_subgroup"] == g]
+                color = config.colors["disease_subgroup"][i]
+                ax.scatter(x[0], x[1], color=color, label=g, alpha=0.5)
+                ax.scatter(
+                    x[0].mean(),
+                    x[1].mean(),
+                    marker="^",
+                    color=color,
+                    s=200,
+                    edgecolor="black",
+                    linewidth=2,
+                )
+
+                xp = x.groupby("sample").mean()
+                ax.scatter(
+                    xp[0],
+                    xp[1],
+                    marker=".",
+                    color=color,
+                    s=100,
+                    edgecolor="black",
+                    linewidth=2,
+                )
+                for p in xp.index:
+                    ax.text(xp.loc[p, 0], xp.loc[p, 1], s=p)
+
+        else:
+            x = rep.dropna(subset=[attr])
+            s = ax.scatter(x[0], x[1], c=x[attr], alpha=0.85)
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size="5%", pad=0.05)
+            fig.colorbar(s, cax=cax, orientation="vertical", label=attr)
+
+        # ax.set(xlabel=f"{name}1", ylabel=f"{name}2")
+        ax.legend(bbox_to_anchor=(0, -0.1), loc="upper left")
+    return fig
 
 
 if __name__ == "__main__" and "get_ipython" not in locals():
