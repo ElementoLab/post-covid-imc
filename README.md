@@ -2,7 +2,7 @@
 
 [![Zenodo badge](https://zenodo.org/badge/doi/10.5281/zenodo.7060271.svg)](https://doi.org/10.5281/zenodo.7060271)
 
-[![medRxiv badge](https://zenodo.org/badge/doi/__doi1___.svg)](https://doi.org/__doi1___) ⬅️ read the preprint here
+[![medRxiv badge](https://zenodo.org/badge/doi/10.1101/2022.11.28.22282811.svg)](https://doi.org/10.1101/2022.11.28.22282811) ⬅️ read the preprint here
 
 This repository contains source code used to analyze the data in the above manuscript.
 
