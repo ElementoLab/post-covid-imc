@@ -24,7 +24,7 @@ pd.read_csv = partial(pd.read_csv, engine="pyarrow")
 
 class config:
     # constants
-    channels_exclude_strings: tp.Final[tp.List[str]] = [
+    channels_exclude_strings: tp.Final[list[str]] = [
         "<EMPTY>",
         "_EMPTY_",
         "190BCKG",
@@ -32,7 +32,7 @@ class config:
         "129Xe",
         "Ki67",
     ]
-    roi_exclude_strings: tp.Final[tp.List[str]] = [
+    roi_exclude_strings: tp.Final[list[str]] = [
         "A19_15_A24-01",
         "A19_15_A24-02",
         "A19_15_A24-03",
@@ -44,11 +44,11 @@ class config:
         "A21_22_A38-06",
     ]
 
-    channels_exclude: tp.List[str]
-    channels_include: tp.List[str]
+    channels_exclude: list[str]
+    channels_include: list[str]
 
     ## Major attributes to contrast when comparing observation groups
-    attributes: tp.Final[tp.List[str]] = [
+    attributes: tp.Final[list[str]] = [
         "disease",
         "disease_subgroup",
         "age",
@@ -56,7 +56,7 @@ class config:
     ]
     numeric_attributes = ["age"]
 
-    attribute_order: tp.Dict[str, tp.List[str]] = dict(
+    attribute_order: tp.Dict[str, list[str]] = dict(
         disease=[
             "Normal",
             "UIP/IPF",
